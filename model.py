@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Function
+from torchvision.ops import RoIAlign
 
 from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d, conv2d_gradfix
 
@@ -665,32 +666,30 @@ class Encoder(nn.Module):
         self.n_latents = log_size*2 - 2
         
         convs = []
-        convs.append(
-            ConvLayer(3, 32, 3),
-            ConvLayer(32, 64, 3),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
+        convs.append(ConvLayer(3, 32, 3))
+        convs.append(ConvLayer(32, 64, 3))
+        convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
 
         res_num = [1,2,5,3]
         res = 0
         in_channel = 128
         for i in range(8, 4, -1):
             out_channel = channels[2 ** (i - 1)]
-            for j in res_num[res]:
+            for j in range(0,res_num[res]):
                 convs.append(ResBlock(in_channel, out_channel))
 
             if i == 5: # Conv4-1 (마지막 layer)
                 convs.append(ConvLayer(out_channel, out_channel, 3))
             else: 
-                convs.append(
-                    ConvLayer(out_channel, out_channel, 3)
-                    nn.MaxPool2d(kernel_size=2, stride=2)
-                    )
+                convs.append(ConvLayer(out_channel, out_channel, 3))
+                convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
             in_channel = out_channel
+            res+=1
             
         # RoI align operator
-        convs.append
-            res+=1
+        convs.append(
+            a = RoIAlign(1, spatial_scale = , sampling_ratio = )
+        )
 
         self.convs = nn.Sequential(*convs)
 

@@ -248,7 +248,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--data", type=str, default=None)
-    parser.add_argument("--g_ckpt", type=str, default=None)
+    parser.add_argument("--g_ckpt", type=str, default='./checkpoint/100000.pt')
     parser.add_argument("--e_ckpt", type=str, default=None)
 
     parser.add_argument("--device", type=str, default='cuda')
@@ -280,9 +280,10 @@ if __name__ == "__main__":
     args.n_mlp = g_args.n_mlp
     args.channel_multiplier = g_args.channel_multiplier
     
-    encoder = Encoder(args.size, args.latent).to(device)
-    generator = Generator(args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier).to(device)
-    discriminator = Discriminator(args.size, channel_multiplier=args.channel_multiplier).to(device)
+    generator = Generator().to(device)
+    discriminator = Discriminator(channel_multiplier=args.channel_multiplier).to(device)
+    encoder = Encoder().to(device)
+    print(encoder)
 
     e_optim = optim.Adam(
         encoder.parameters(),
