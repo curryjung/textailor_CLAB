@@ -220,12 +220,12 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
             logger.add_scalar('D_loss/adv', d_loss_val, i)
             logger.add_scalar('D_loss/r1', r1_val, i)            
         
-        if i % 100 == 0:
+        if i % 1000 == 0:
             with torch.no_grad():
                 sample = torch.cat([real_img.detach(), recon_img.detach()])
                 utils.save_image(
                     sample,
-                    f"sample/{str(i).zfill(6)}.png",
+                    f"sample/encoder_{str(i).zfill(6)}.png",
                     nrow=int(args.batch),
                     normalize=True,
                     range=(-1, 1),
@@ -247,7 +247,7 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--data", type=str, default=None)
+    parser.add_argument("--data", type=str, default='/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/')
     parser.add_argument("--g_ckpt", type=str, default='./checkpoint/100000.pt')
     parser.add_argument("--e_ckpt", type=str, default=None)
 
