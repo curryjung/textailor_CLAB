@@ -703,6 +703,7 @@ class Encoder(nn.Module):
             else: 
                 convs.append(ConvLayer(in_channel, in_channel, 3))
                 convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                
             res+=1
             
         # RoI align operator

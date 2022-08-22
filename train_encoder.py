@@ -118,7 +118,7 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
     trunc.requires_grad = False
     
     if SummaryWriter and args.tensorboard:
-        logger = SummaryWriter(logdir='./checkpoint')    
+        logger = SummaryWriter()    
     
     for idx in pbar:
         i = idx + args.start_iter
