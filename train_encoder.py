@@ -12,14 +12,13 @@ import torch.distributed as dist
 import torchvision
 from torchvision import transforms, utils
 from tqdm import tqdm
+import torchvision.transforms.functional as Function
+
 
 from model import Encoder, Generator, Discriminator
-from dataset import MultiResolutionDataset
+from dataset import IMGUR5K_Handwriting
 
-try:
-    from tensorboardX import SummaryWriter
-except ImportError:
-    SummaryWriter = None
+from torch.utils.tensorboard import SummaryWriter
 
 
 def data_sampler(dataset, shuffle):
@@ -113,12 +112,19 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
 
     requires_grad(generator, False)
     
-    truncation = 0.7
-    trunc = generator.mean_latent(4096).detach()
-    trunc.requires_grad = False
+    truncation = 1
+    #trunc = generator.mean_latent(4096).detach()
+    #trunc.requires_grad = False
     
     if SummaryWriter and args.tensorboard:
         logger = SummaryWriter()    
+    
+    sample_c = torch.randn(args.n_sample, 16, device=device)
+
+    samples = next(loader)
+    samples_enc = Function.resize(samples, (256,256))
+    samples = samples.to(device)
+    samples_enc = samples_enc.to(device)
     
     for idx in pbar:
         i = idx + args.start_iter
@@ -132,19 +138,20 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
         requires_grad(encoder, False)
         requires_grad(discriminator, True)
         
+        real_img_dis = next(loader)#[64,256]
+        real_img_enc = next(loader)
+        real_img_enc = Function.resize(real_img_enc, (256,256))
 
-        real_img = next(loader)
-        real_img = real_img.to(device)
-        
-        latents = encoder(real_img)
-        recon_img, _ = generator([latents],
-                                 input_is_latent=True,
-                                 truncation=truncation,
-                                 truncation_latent=trunc,
-                                 randomize_noise=False)
+        real_img_dis = real_img_dis.to(device)
+        real_img_enc = real_img_enc.to(device)
+
+        latents = encoder(real_img_enc)
+        content = torch.randn(args.batch, 16, device=device)
+
+        recon_img, _ = generator(content, [latents])
 
         recon_pred = discriminator(recon_img)
-        real_pred = discriminator(real_img)
+        real_pred = discriminator(real_img_dis)
         d_loss = d_logistic_loss(real_pred, recon_pred)
 
         loss_dict["d"] = d_loss
@@ -156,9 +163,9 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
         d_regularize = i % args.d_reg_every == 0
 
         if d_regularize:
-            real_img.requires_grad = True
-            real_pred = discriminator(real_img)
-            r1_loss = d_r1_loss(real_pred, real_img)
+            real_img_dis.requires_grad = True
+            real_pred = discriminator(real_img_dis)
+            r1_loss = d_r1_loss(real_pred, real_img_dis)
 
             discriminator.zero_grad()
             (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
@@ -171,20 +178,19 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
         requires_grad(encoder, True)
         requires_grad(discriminator, False)
 
-        real_img = real_img.detach()
-        real_img.requires_grad = False
+        real_img_enc = real_img_enc.detach()
+        real_img_enc.requires_grad = False
 
-        latents = encoder(real_img)
-        recon_img, _ = generator([latents], 
-                                 input_is_latent=True,
-                                 truncation=truncation,
-                                 truncation_latent=trunc,
-                                 randomize_noise=False)
+        real_img_dis = real_img_dis.detach()
+        real_img_dis.requires_grad = False
+        
+        latents = encoder(real_img_enc)
+        recon_img, _ = generator(content, [latents])
 
-        recon_vgg_loss = vgg_loss(recon_img, real_img)
+        recon_vgg_loss = vgg_loss(recon_img, real_img_dis)
         loss_dict["vgg"] = recon_vgg_loss * args.vgg
 
-        recon_l2_loss = F.mse_loss(recon_img, real_img)
+        recon_l2_loss = F.mse_loss(recon_img, real_img_dis)
         loss_dict["l2"] = recon_l2_loss * args.l2
         
         recon_pred = discriminator(recon_img)
@@ -220,18 +226,24 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
             logger.add_scalar('D_loss/adv', d_loss_val, i)
             logger.add_scalar('D_loss/r1', r1_val, i)            
         
-        if i % 1000 == 0:
+        if i % 100 == 0:
             with torch.no_grad():
-                sample = torch.cat([real_img.detach(), recon_img.detach()])
+                real_sample = torch.cat([img for img in samples], dim=1)
+
+                sample_latents = encoder(samples_enc)
+                recon_samples, _ = generator(sample_c, [sample_latents])
+                recon_sample = torch.cat([img_gen for img_gen in recon_samples], dim=1)
+
+                final_sample = torch.cat([real_sample.detach(), recon_sample.detach()], dim=2)
                 utils.save_image(
-                    sample,
-                    f"sample/encoder_{str(i).zfill(6)}.png",
-                    nrow=int(args.batch),
+                    final_sample,
+                    f"encoder_sample/encoder_{str(i).zfill(6)}.png",
+                    nrow=4,
                     normalize=True,
                     range=(-1, 1),
                 )
 
-        if i % 10000 == 0:
+        if i % 1000 == 0:
             torch.save(
                 {
                     "e": encoder.state_dict(),
@@ -247,13 +259,14 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--data", type=str, default='/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/')
+    parser.add_argument("--path", type=str, default='/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/')
     parser.add_argument("--g_ckpt", type=str, default='./checkpoint/100000.pt')
     parser.add_argument("--e_ckpt", type=str, default=None)
 
     parser.add_argument("--device", type=str, default='cuda')
     parser.add_argument("--iter", type=int, default=1000000)
-    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--n_sample", type=int, default=16)
     parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--local_rank", type=int, default=0)
 
@@ -283,7 +296,6 @@ if __name__ == "__main__":
     generator = Generator().to(device)
     discriminator = Discriminator(channel_multiplier=args.channel_multiplier).to(device)
     encoder = Encoder().to(device)
-    print(encoder)
 
     e_optim = optim.Adam(
         encoder.parameters(),
@@ -324,7 +336,7 @@ if __name__ == "__main__":
         ]
     )
 
-    dataset = MultiResolutionDataset(args.data, transform, args.size)
+    dataset = IMGUR5K_Handwriting(args.path)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
