@@ -571,35 +571,20 @@ class ConvLayer(nn.Sequential):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1]):
+    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1], encoder=False):
         super().__init__()
 
         self.conv1 = ConvLayer(in_channel, in_channel, 3)
-        self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
-
-        self.skip = ConvLayer(
-            in_channel, out_channel, 1, downsample=True, activate=False, bias=False
-        )
-
-    def forward(self, input):
-        out = self.conv1(input)
-        out = self.conv2(out)
-
-        skip = self.skip(input)
-        out = (out + skip) / math.sqrt(2)
-
-        return out
-
-class Enc_ResBlock(nn.Module):
-    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1]):
-        super().__init__()
-
-        self.conv1 = ConvLayer(in_channel, in_channel, 3)
-        self.conv2 = ConvLayer(in_channel, out_channel, 3)
-
-        self.skip = ConvLayer(
-            in_channel, out_channel, 1, activate=False, bias=False
-        )
+        if encoder:
+            self.conv2 = ConvLayer(in_channel, out_channel, 3)
+            self.skip = ConvLayer(
+                in_channel, out_channel, 1, activate=False, bias=False
+            )
+        else:
+            self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
+            self.skip = ConvLayer(
+                in_channel, out_channel, 1, downsample=True, activate=False, bias=False
+            )
 
     def forward(self, input):
         out = self.conv1(input)
@@ -620,6 +605,8 @@ class Discriminator(nn.Module):
             16: 512,
             32: 512,
             64: 512,
+            128: 512,
+            256: 512,
         }
 
         size = 64
@@ -677,7 +664,7 @@ class Encoder(nn.Module):
             32: 512,
             64: 256,
             128: 128,
-            256: 32
+            256: 64
         }        
         
         self.w_dim = w_dim
@@ -692,27 +679,27 @@ class Encoder(nn.Module):
 
         res_num = [1,2,5,3]
         res = 0
-        in_channel = 128
+        
+        in_channel = 64
         for i in range(8, 4, -1):
-            in_channel = channels[2 ** (i-1)]
+            out_channel = channels[2 ** (i-1)]
             for j in range(0,res_num[res]):
-                convs.append(ResBlock(in_channel, in_channel))
+                if j==0:
+                    convs.append(ResBlock(in_channel, out_channel,encoder=True))
+                else:
+                    convs.append(ResBlock(out_channel, out_channel,encoder=True))
 
             if i == 5: # Conv4-1 (마지막 layer)
-                convs.append(ConvLayer(in_channel, in_channel, 3))
+                convs.append(ConvLayer(out_channel, out_channel, 3))
             else: 
-                convs.append(ConvLayer(in_channel, in_channel, 3))
+                convs.append(ConvLayer(out_channel, out_channel, 3))
                 convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
-                
+            in_channel=out_channel
             res+=1
             
-        # RoI align operator
-        convs.append(
-            RoIAlign(1, spatial_scale = 1, sampling_ratio = -1)
-        )
-
+        convs.append(nn.AvgPool2d(kernel_size=16,stride=1))
         self.convs = nn.Sequential(*convs)
 
     def forward(self, input):
         out = self.convs(input)
-        return out.view(len(input), self.n_latents, self.w_dim)
+        return out.view(len(input), 512)

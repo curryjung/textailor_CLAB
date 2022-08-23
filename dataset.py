@@ -27,7 +27,7 @@ class IMGUR5K_Handwriting(Dataset):
         if transform is None:
             self.transform = transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Resize((64,256)),
+                transforms.Resize((64,256)), 
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
             ])
         else:
