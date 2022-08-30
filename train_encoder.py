@@ -15,7 +15,7 @@ from tqdm import tqdm
 import torchvision.transforms.functional as Function
 
 
-from model import Encoder, Generator, Discriminator
+from model import Encoder, another_Encoder, Generator, Discriminator
 from dataset import IMGUR5K_Handwriting
 
 from torch.utils.tensorboard import SummaryWriter
@@ -133,46 +133,8 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
             print("Done!")
 
             break
-
-        # D update
-        requires_grad(encoder, False)
-        requires_grad(discriminator, True)
-        
-        real_img_dis = next(loader)#[64,256]
         real_img_enc = next(loader)
-        real_img_enc = Function.resize(real_img_enc, (256,256))
-
-        real_img_dis = real_img_dis.to(device)
         real_img_enc = real_img_enc.to(device)
-
-        latents = encoder(real_img_enc)
-        content = torch.randn(args.batch, 16, device=device)
-
-        recon_img, _ = generator(content, [latents])
-
-        recon_pred = discriminator(recon_img)
-        real_pred = discriminator(real_img_dis)
-        d_loss = d_logistic_loss(real_pred, recon_pred)
-
-        loss_dict["d"] = d_loss
-
-        discriminator.zero_grad()
-        d_loss.backward()
-        d_optim.step()
-
-        d_regularize = i % args.d_reg_every == 0
-
-        if d_regularize:
-            real_img_dis.requires_grad = True
-            real_pred = discriminator(real_img_dis)
-            r1_loss = d_r1_loss(real_pred, real_img_dis)
-
-            discriminator.zero_grad()
-            (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
-
-            d_optim.step()
-
-        loss_dict["r1"] = r1_loss
 
         # E update
         requires_grad(encoder, True)
@@ -181,50 +143,41 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
         real_img_enc = real_img_enc.detach()
         real_img_enc.requires_grad = False
 
-        real_img_dis = real_img_dis.detach()
-        real_img_dis.requires_grad = False
-        
         latents = encoder(real_img_enc)
+        content = torch.randn(args.batch, 16, device=device)
         recon_img, _ = generator(content, [latents])
 
-        recon_vgg_loss = vgg_loss(recon_img, real_img_dis)
-        loss_dict["vgg"] = recon_vgg_loss * args.vgg
+        #recon_vgg_loss = vgg_loss(recon_img, real_img_dis)
+        #loss_dict["vgg"] = recon_vgg_loss * args.vgg
 
-        recon_l2_loss = F.mse_loss(recon_img, real_img_dis)
+        recon_l2_loss = F.mse_loss(recon_img, real_img_enc)
         loss_dict["l2"] = recon_l2_loss * args.l2
         
-        recon_pred = discriminator(recon_img)
-        adv_loss = g_nonsaturating_loss(recon_pred) * args.adv
-        loss_dict["adv"] = adv_loss
+        #recon_pred = discriminator(recon_img)
+        #adv_loss = g_nonsaturating_loss(recon_pred) * args.adv
+        #loss_dict["adv"] = adv_loss
 
-        e_loss = recon_vgg_loss + recon_l2_loss + adv_loss 
+        e_loss = recon_l2_loss 
         loss_dict["e_loss"] = e_loss
 
-        
         encoder.zero_grad()
         e_loss.backward()
         e_optim.step()
 
         e_loss_val = loss_dict["e_loss"].item()
-        vgg_loss_val = loss_dict["vgg"].item()
+        #vgg_loss_val = loss_dict["vgg"].item()
         l2_loss_val = loss_dict["l2"].item()
-        adv_loss_val = loss_dict["adv"].item()
-        d_loss_val = loss_dict["d"].item()
-        r1_val = loss_dict["r1"].item()
+        #adv_loss_val = loss_dict["adv"].item()
 
         pbar.set_description(
             (
-                f"e: {e_loss_val:.4f}; vgg: {vgg_loss_val:.4f}; l2: {l2_loss_val:.4f}; adv: {adv_loss_val:.4f}; d: {d_loss_val:.4f}; r1: {r1_val:.4f}; "
+                f"e: {e_loss_val:.4f}; l2: {l2_loss_val:.4f};"
             )
         )
 
         if SummaryWriter and args.tensorboard:
             logger.add_scalar('E_loss/total', e_loss_val, i)
-            logger.add_scalar('E_loss/vgg', vgg_loss_val, i)
-            logger.add_scalar('E_loss/l2', l2_loss_val, i)
-            logger.add_scalar('E_loss/adv', adv_loss_val, i)
-            logger.add_scalar('D_loss/adv', d_loss_val, i)
-            logger.add_scalar('D_loss/r1', r1_val, i)            
+            logger.add_scalar('E_loss/l2', l2_loss_val, i)  
         
         if i % 100 == 0:
             with torch.no_grad():
@@ -295,7 +248,7 @@ if __name__ == "__main__":
     
     generator = Generator().to(device)
     discriminator = Discriminator(channel_multiplier=args.channel_multiplier).to(device)
-    encoder = Encoder().to(device)
+    encoder = another_Encoder().to(device)
 
     e_optim = optim.Adam(
         encoder.parameters(),

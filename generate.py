@@ -4,10 +4,16 @@ import torch
 from torchvision import utils
 from model import Generator
 from tqdm import tqdm
+import json
 
 
 def generate(args, g_ema, device, mean_latent):
 
+    w_mean_std_dic={}
+    w_mean_std_dic['mean'] = []
+    w_mean_std_dic['std'] = []
+    w_mean_std_dic['mean_mean']=0
+    
     with torch.no_grad():
         g_ema.eval()
         for i in tqdm(range(args.pics)):
@@ -15,17 +21,41 @@ def generate(args, g_ema, device, mean_latent):
                 sample_z = torch.randn(args.sample, args.latent, device=device) #styles
                 sample_c = torch.randn(args.sample, 16, device=device) #content
 
-                sample, _ = g_ema(
-                    sample_c, [sample_z]
-                )
+                if not args.save_w_std:
+                    sample, _ = g_ema(
+                        sample_c, [sample_z]
+                    )
+                else:
+                    style_layer = g_ema.style
+                    ws = style_layer(sample_z)
 
-                utils.save_image(
-                    sample,
-                    f"result/{str(i).zfill(6)}.png",
-                    nrow=1,
-                    normalize=True,
-                    range=(-1, 1),
-                )
+                    means = ws.mean(dim=1).to('cpu')
+                    stds = ws.std(dim=1).to('cpu')
+
+                    for mean, std in zip(means,stds):
+                        w_mean_std_dic['mean'].append(float(mean.numpy()))
+                        w_mean_std_dic['std'].append(float(std.numpy()))
+
+                    w_mean_std_dic['mean_mean'] = sum(w_mean_std_dic['mean'])/len(w_mean_std_dic['mean'])
+                    w_mean_std_dic['std_mean'] = sum(w_mean_std_dic['std'])/len(w_mean_std_dic['std'])
+
+                    
+
+                    with open('/home/sy/textailor_CLAB/w_mean_std.json', 'w') as f:
+                        json.dump(w_mean_std_dic, f)
+                    
+
+        
+                    
+
+                if not args.save_w_std:
+                    utils.save_image(
+                        sample,
+                        f"result/{str(i).zfill(6)}.png",
+                        nrow=1,
+                        normalize=True,
+                        range=(-1, 1),
+                    )
 
             else: #style mixing
                 source = torch.randn(args.sample, args.latent, device=device)
@@ -75,6 +105,7 @@ def generate(args, g_ema, device, mean_latent):
                 
 
 
+
 if __name__ == "__main__":
     device = "cuda"
 
@@ -86,11 +117,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sample",
         type=int,
-        default=1,
+        default=16,
         help="number of samples to be generated for each image",
     )
     parser.add_argument(
-        "--pics", type=int, default=5, help="number of images to be generated"
+        "--pics", type=int, default=500, help="number of images to be generated"
     )
     parser.add_argument("--truncation", type=float, default=1, help="truncation ratio")
     parser.add_argument(
@@ -102,7 +133,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="./checkpoint/080000.pt",
+        default="/home/sy/textailor_CLAB/checkpoint/100000.pt",
         help="path to the model checkpoint",
     )
     parser.add_argument(
@@ -114,6 +145,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--style_mix", action="store_true", help="style mixing"
     )
+
+    parser.add_argument(
+        "--save_w_std",type=bool, default=True,
+    )
+
+
     args = parser.parse_args()
     args.latent = 512
     args.n_mlp = 8

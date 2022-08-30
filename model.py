@@ -8,6 +8,8 @@ from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Function
 from torchvision.ops import RoIAlign
+from torchvision.models import resnet50
+
 
 from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d, conv2d_gradfix
 
@@ -454,6 +456,11 @@ class Generator(nn.Module):
 
             self.to_rgbs.append(ToRGB(512, style_dim))
 
+    def set_style_input(self, batch_size, latent_dim):
+
+        setattr(self, "constant_style",
+                nn.Parameter(torch.randn(batch_size, latent_dim)))
+
     def forward(
         self,
         content,
@@ -464,11 +471,16 @@ class Generator(nn.Module):
         finish_index=None,
         return_latents=False,
         style_mix=False,
+        input_is_latent=False,
+        # optimize_style_latent=False,
     ):
         # style mapping network
         # random style
+        if not input_is_latent:
+            styles = [self.style(s) for s in styles]
+        # else:
+        #     styles = getattr(self,'constant_style')
 
-        styles = [self.style(s) for s in styles]
 
         if style_mix:
             t_styles = [self.style(t) for t in target_styles]
@@ -569,6 +581,50 @@ class ConvLayer(nn.Sequential):
 
         super().__init__(*layers)
 
+class Origin_ConvLayer(nn.Sequential):
+    def __init__(
+        self,
+        in_channel,
+        out_channel,
+        kernel_size,
+        downsample=False,
+        blur_kernel=[1, 3, 3, 1],
+        bias=True,
+        activate=True,
+    ):
+        layers = []
+
+        if downsample:
+            factor = 2
+            p = (len(blur_kernel) - factor) + (kernel_size - 1)
+            pad0 = (p + 1) // 2
+            pad1 = p // 2
+
+            layers.append(Blur(blur_kernel, pad=(pad0, pad1)))
+
+            stride = 2
+            self.padding = 0
+
+        else:
+            stride = 1
+            self.padding = kernel_size // 2
+
+        layers.append(
+            torch.nn.Conv2d(
+                in_channel,
+                out_channel,
+                kernel_size,
+                padding=self.padding,
+                stride=stride,
+                bias=bias# and not activate,
+            )
+        )
+
+        if activate:
+            layers.append(FusedLeakyReLU(out_channel, bias=bias))
+
+        super().__init__(*layers)
+
 
 class ResBlock(nn.Module):
     def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1], encoder=False):
@@ -583,6 +639,32 @@ class ResBlock(nn.Module):
         else:
             self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
             self.skip = ConvLayer(
+                in_channel, out_channel, 1, downsample=True, activate=False, bias=False
+            )
+
+    def forward(self, input):
+        out = self.conv1(input)
+        out = self.conv2(out)
+
+        skip = self.skip(input)
+        out = (out + skip) / math.sqrt(2)
+
+        return out
+
+
+class Origin_ResBlock(nn.Module):
+    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1], encoder=False):
+        super().__init__()
+
+        self.conv1 = Origin_ConvLayer(in_channel, in_channel, 3)
+        if encoder:
+            self.conv2 = Origin_ConvLayer(in_channel, out_channel, 3)
+            self.skip = Origin_ConvLayer(
+                in_channel, out_channel, 1, activate=False, bias=False
+            )
+        else:
+            self.conv2 = Origin_ConvLayer(in_channel, out_channel, 3, downsample=True)
+            self.skip = Origin_ConvLayer(
                 in_channel, out_channel, 1, downsample=True, activate=False, bias=False
             )
 
@@ -693,6 +775,82 @@ class Encoder(nn.Module):
                 convs.append(ConvLayer(out_channel, out_channel, 3))
             else: 
                 convs.append(ConvLayer(out_channel, out_channel, 3))
+                convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            in_channel=out_channel
+            res+=1
+            
+        convs.append(nn.AvgPool2d(kernel_size=16,stride=1))
+        self.convs = nn.Sequential(*convs)
+
+    def forward(self, input):
+        out = self.convs(input)
+        return out.view(len(input), 512)
+
+
+class ImageToLatent(torch.nn.Module):
+    def __init__(self, image_size=256):
+        super().__init__()
+        
+        self.image_size = image_size
+        self.activation = torch.nn.ELU()
+        
+        self.resnet = list(resnet50(pretrained=False).children())[:-2]
+        self.resnet = torch.nn.Sequential(*self.resnet)
+        self.conv2d = torch.nn.Conv2d(2048, 512, kernel_size=1)
+        # self.flatten = torch.nn.Flatten()
+        # self.dense1 = torch.nn.Linear(16384, 256)
+        # self.dense2 = torch.nn.Linear(256, (18 * 512))
+        self.maxpool = nn.MaxPool2d(kernel_size=8, stride=1)
+
+
+    def forward(self, image):
+        x = self.resnet(image)
+        x = self.conv2d(x)
+        x = self.maxpool(x)
+        x= x.view(len(image), 512)
+
+        return x
+
+
+class Encoder_js(nn.Module):
+    def __init__(self, w_dim=512):
+        super().__init__()
+        
+        size = 256
+        channels = {
+            16: 512,
+            32: 512,
+            64: 256,
+            128: 128,
+            256: 64
+        }        
+        
+        self.w_dim = w_dim
+        log_size = int(math.log(size, 2))
+        
+        self.n_latents = log_size*2 - 2
+        
+        convs = []
+        convs.append(Origin_ConvLayer(3, 32, 3))
+        convs.append(Origin_ConvLayer(32, 64, 3))
+        convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
+
+        res_num = [1,2,5,3]
+        res = 0
+        
+        in_channel = 64
+        for i in range(8, 4, -1):
+            out_channel = channels[2 ** (i-1)]
+            for j in range(0,res_num[res]):
+                if j==0:
+                    convs.append(Origin_ResBlock(in_channel, out_channel,encoder=True))
+                else:
+                    convs.append(Origin_ResBlock(out_channel, out_channel,encoder=True))
+
+            if i == 5: # Conv4-1 (마지막 layer)
+                convs.append(Origin_ConvLayer(out_channel, out_channel, 3))
+            else: 
+                convs.append(Origin_ConvLayer(out_channel, out_channel, 3))
                 convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
             in_channel=out_channel
             res+=1
