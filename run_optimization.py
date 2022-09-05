@@ -1,4 +1,5 @@
 import argparse
+from locale import normalize
 import math
 import random
 import os
@@ -43,7 +44,7 @@ def run_z_optimizer(args, loader, generator):
 
     curdir = os.path.dirname(os.path.abspath(__file__))
     exp_dir = os.path.join(curdir, args.exp_name)
-    dst_dir = os.path.join(exp_dir, args.exp_disc)
+    dst_dir = os.path.join(exp_dir, args.exp_desc)
     
     if not os.path.exists(exp_dir):
         os.makedirs(exp_dir)
@@ -97,7 +98,7 @@ def run_z_optimizer(args, loader, generator):
             # print('Iter: [{:4d}] MSE Loss: {:.4f}'.format(iter, loss.item()))
             pass
 
-        if idx % args.sample_interval == 0:
+        if idx % args.visual_step == 0:
             #concat sample and batch
             sample = torch.cat((batch.cpu().detach(), output.cpu().detach()), axis=0)
 
@@ -105,7 +106,7 @@ def run_z_optimizer(args, loader, generator):
             sample = make_grid(sample, nrow=args.batch, normalize=True, scale_each=True)
 
             #save image
-            save_image(sample, os.path.join(dst_dir, '{}.png'.format(idx)), nrow=args.batch, normalize=True, scale_each=True)
+            save_image(sample, os.path.join(dst_dir, '{}.png'.format(idx)), nrow=args.batch,normalize=True, scale_each=True)
             print('Saved image at {}'.format(os.path.join(dst_dir, '{}.png'.format(idx))))
 
 
@@ -114,7 +115,7 @@ def run_w_optimizer(args, loader, generator):
     #set directory
     curdir = os.path.dirname(os.path.abspath(__file__))
     exp_dir = os.path.join(curdir, args.exp_name)
-    dst_dir = os.path.join(exp_dir, args.exp_disc)
+    dst_dir = os.path.join(exp_dir, args.exp_desc)
     
     if not os.path.exists(exp_dir):
         os.makedirs(exp_dir)
@@ -173,7 +174,7 @@ def run_w_optimizer(args, loader, generator):
             # print('Iter: [{:4d}] MSE Loss: {:.4f}'.format(iter, loss.item()))
             pass
 
-        if idx % args.sample_interval == 0:
+        if idx % args.visual_step == 0:
             #concat sample and batch
             sample = torch.cat((batch.cpu().detach(), output.cpu().detach()), axis=0)
 
@@ -187,7 +188,7 @@ def run_w_optimizer(args, loader, generator):
 
 
     img = make_grid(output, nrow=1, normalize=True, scale_each=True)
-    save_image(img, os.path.join(dst_dir, '0.png'), nrow=1, normalize=True, scale_each=True)
+    save_image(img, os.path.join(dst_dir, '0.png'), nrow=1, scale_each=True)
 
 
 
@@ -203,7 +204,7 @@ if __name__ =="__main__":
     parser.add_argument("--g_ckpt", type=str, default='/home/sy/textailor_CLAB/checkpoint/100000.pt')
     parser.add_argument("--e_ckpt", type=str, default=None)
     parser.add_argument("--exp_name", type=str, default="run_js")
-    parser.add_argument("--exp_disc", type=str, default="optimize_w_input")
+    parser.add_argument("--exp_desc", type=str, default="optimize_w_input", help="experiment description")
     
     parser.add_argument("--run_z_optimizer", action='store_true')
     parser.add_argument("--run_w_optimizer", action='store_true')
@@ -215,7 +216,7 @@ if __name__ =="__main__":
     parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100)
-    parser.add_argument("--sample_interval", type=int, default=1000)
+    parser.add_argument("--visual_step", type=int, default=1000)
 
     parser.add_argument("--vgg", type=float, default=1.0)
     parser.add_argument("--l2", type=float, default=1.0)
@@ -260,9 +261,10 @@ if __name__ =="__main__":
     )
 
 
-    # if args.run_z_optimizer:
-    #     run_z_optimizer(args, loader, generator)
-    # elif args.run_w_optimizer:
-    #     run_w_optimizer(args, loader, generator)
-    run_w_optimizer(args, loader, generator)
+    if args.run_w_optimizer:
+        print("run_w_optimizer")
+        run_w_optimizer(args, loader, generator)
+    elif args.run_z_optimizer:
+        print("run_z_optimizer")
+        run_z_optimizer(args, loader, generator)
 
