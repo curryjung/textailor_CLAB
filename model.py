@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from torch.autograd import Function
 from torchvision.ops import RoIAlign
 from torchvision.models import resnet50
+from torchvision.transforms import functional as F
 
 
 from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d, conv2d_gradfix
@@ -388,155 +389,6 @@ class MaskConv(nn.Module):
 
         return out
 
-class Generator(nn.Module):
-    def __init__(
-        self,
-        blur_kernel=[1, 3, 3, 1],
-        lr_mlp=0.01
-    ):
-        super().__init__()
-
-        channels = {
-            4: 512,
-            8: 512,
-            16: 512,
-            32: 512,
-            64: 512
-        }
-        
-        # style mapping network 2 layers
-        layers = [PixelNorm()]
-        for i in range(0, 2):
-            layers.append(
-                EqualLinear(
-                    512, 512, lr_mul=lr_mlp, activation="fused_lrelu"
-                )
-            )
-        self.style = nn.Sequential(*layers)
-        style_dim = 512
-
-        #self.style_encoder = Style_encoder() #style encoder
-        #self.content_encoder = Content_encoder() # content encoder
-        
-        self.input = ConstantInput(512)
-        # block 1
-        self.conv1 = StyledConv(
-            512, 512, 3, style_dim, blur_kernel=blur_kernel
-        )
-        self.to_rgb1 = ToRGB(512, style_dim, upsample=False)
-
-        size = 256
-
-        self.log_size = int(math.log(size, 2))
-        self.num_layers = (self.log_size - 2) * 2 + 1
-        self.n_latent = 14 #mask conV 없을 때는 14, 있을 때는 15
-
-        self.convs = nn.ModuleList()
-        self.to_rgbs = nn.ModuleList()
-        self.masks = nn.ModuleList()
-
-        # styleconv channel=512, kernel=3
-        for i in range(0,4): #block 2-5
-            self.convs.append(
-                StyledConv(
-                    512,
-                    512,
-                    3,
-                    style_dim,
-                    upsample=True,
-                    blur_kernel=blur_kernel
-                )
-            )
-
-            self.convs.append(
-                StyledConv(
-                    512, 512, 3, style_dim, blur_kernel=blur_kernel
-                )
-            )
-
-            self.to_rgbs.append(ToRGB(512, style_dim))
-
-    def set_style_input(self, batch_size, latent_dim):
-
-        setattr(self, "constant_style",
-                nn.Parameter(torch.randn(batch_size, latent_dim)))
-
-    def forward(
-        self,
-        content,
-        styles,
-        random_out=False,
-        target_styles=None,
-        start_index=None,
-        finish_index=None,
-        return_latents=False,
-        style_mix=False,
-        input_is_latent=False,
-        # optimize_style_latent=False,
-    ):
-        # style mapping network
-        # random style
-        if not input_is_latent:
-            styles = [self.style(s) for s in styles]
-        # else:
-        #     styles = getattr(self,'constant_style')
-
-
-        if style_mix:
-            t_styles = [self.style(t) for t in target_styles]
-            styles +=t_styles
-
-        if len(styles) < 2:
-            start_index = self.n_latent
-
-            if styles[0].ndim < 3:
-                latent = styles[0].unsqueeze(1).repeat(1, start_index, 1)
-
-            else:
-                latent = styles[0]
-
-        else:
-            """
-            if start_index is None:
-                start_index = random.randint(1, self.n_latent - 1) 
-            """
-            # self.n_latent=14
-            if not finish_index: 
-                latent = styles[0].unsqueeze(1).repeat(1, start_index, 1)
-                latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - start_index, 1)
-
-                latent = torch.cat([latent, latent2], 1)
-            else:
-                latent = styles[0].unsqueeze(1).repeat(1, start_index, 1)
-                latent2 = styles[1].unsqueeze(1).repeat(1, finish_index - start_index + 1, 1)
-                latent3 = styles[0].unsqueeze(1).repeat(1, self.n_latent - finish_index - 1, 1)
-
-                latent = torch.cat([latent, latent2], 1)
-                latent = torch.cat([latent, latent3], 1)
-
-        out = self.input(content)
-        # block1
-        out = self.conv1(out, latent[:, 0])
-        skip = self.to_rgb1(out, latent[:, 1])
-
-        i = 1
-        for conv1, conv2, to_rgb in zip(
-            self.convs[::2], self.convs[1::2], self.to_rgbs
-        ):
-            out = conv1(out, latent[:, i])
-            out = conv2(out, latent[:, i + 1])
-            skip = to_rgb(out, latent[:, i + 2], skip)
-            i += 2
-
-        image = skip
-
-        if return_latents:
-            return image, latent
-        elif style_mix:
-            return image, None
-        else:
-            return image, None
-
 class ConvLayer(nn.Sequential):
     def __init__(
         self,
@@ -812,7 +664,7 @@ class ImageToLatent(torch.nn.Module):
         return x
 
 
-class Encoder_js(nn.Module):
+class Style_Encoder(nn.Module):
     def __init__(self, w_dim=512):
         super().__init__()
         
@@ -854,10 +706,263 @@ class Encoder_js(nn.Module):
                 convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
             in_channel=out_channel
             res+=1
-            
-        convs.append(nn.AvgPool2d(kernel_size=16,stride=1))
+
+        final = nn.AvgPool2d(kernel_size=16,stride=1)
+        self.final = final
         self.convs = nn.Sequential(*convs)
 
     def forward(self, input):
         out = self.convs(input)
+        out = self.final(out)
         return out.view(len(input), 512)
+
+class Content_Encoder(nn.Module):
+    def __init__(self, w_dim=512, input_channel=1):
+        super().__init__()
+        
+        size = 256
+        channels = {
+            16: 512,
+            32: 512,
+            64: 256,
+            128: 128,
+            256: 64
+        }        
+        
+        self.w_dim = w_dim
+        log_size = int(math.log(size, 2))
+        
+        self.n_latents = log_size*2 - 2
+        
+        convs = []
+        convs.append(Origin_ConvLayer(input_channel, 32, 3)) #Gray Scale Image
+        convs.append(Origin_ConvLayer(32, 64, 3))
+        convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
+
+        res_num = [1,2,5,3]
+        res = 0
+        
+        in_channel = 64
+        for i in range(8, 4, -1):
+            out_channel = channels[2 ** (i-1)]
+            for j in range(0,res_num[res]):
+                if j==0:
+                    convs.append(Origin_ResBlock(in_channel, out_channel,encoder=True))
+                else:
+                    convs.append(Origin_ResBlock(out_channel, out_channel,encoder=True))
+
+            if i == 5: # Conv4-1 (마지막 layer)
+                convs.append(Origin_ConvLayer(out_channel, out_channel, 3))
+            else: 
+                convs.append(Origin_ConvLayer(out_channel, out_channel, 3))
+                convs.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            in_channel=out_channel
+            res+=1
+
+        self.convs = nn.Sequential(*convs)
+
+    def forward(self, input):
+        out = self.convs(input) #out shape:[1,512,4,16]
+        return out
+
+
+class Generator(nn.Module):
+    def __init__(
+        self,
+        blur_kernel=[1, 3, 3, 1],
+        lr_mlp=0.01
+    ):
+        super().__init__()
+
+        channels = {
+            4: 512,
+            8: 512,
+            16: 512,
+            32: 512,
+            64: 512
+        }
+        
+        # style mapping network 2 layers
+        layers = [PixelNorm()]
+        for i in range(0, 2):
+            layers.append(
+                EqualLinear(
+                    512, 512, lr_mul=lr_mlp, activation="fused_lrelu"
+                )
+            )
+        self.style = nn.Sequential(*layers)
+        style_dim = 512
+
+        self.style_encoder = Style_Encoder() #style encoder
+        self.content_encoder = Content_Encoder() # content encoder
+        
+        self.input = ConstantInput(512)
+        # block 1
+        self.conv1 = StyledConv(
+            512, 512, 3, style_dim, blur_kernel=blur_kernel
+        )
+        self.to_rgb1 = ToRGB(512, style_dim, upsample=False)
+
+        size = 256
+
+        self.log_size = int(math.log(size, 2))
+        self.num_layers = (self.log_size - 2) * 2 + 1
+        self.n_latent = 14 #mask conV 없을 때는 14, 있을 때는 15
+
+        self.convs = nn.ModuleList()
+        self.to_rgbs = nn.ModuleList()
+        self.masks = nn.ModuleList()
+
+        # styleconv channel=512, kernel=3
+        for i in range(0,4): #block 2-5
+            self.convs.append(
+                StyledConv(
+                    512,
+                    512,
+                    3,
+                    style_dim,
+                    upsample=True,
+                    blur_kernel=blur_kernel
+                )
+            )
+
+            self.convs.append(
+                StyledConv(
+                    512, 512, 3, style_dim, blur_kernel=blur_kernel
+                )
+            )
+
+            self.to_rgbs.append(ToRGB(512, style_dim))
+
+    def set_style_input(self, batch_size, latent_dim):
+
+        setattr(self, "constant_style",
+                nn.Parameter(torch.randn(batch_size, latent_dim)))
+
+    def forward(
+        self,
+        content,
+        styles,
+        random_out=False,
+        target_styles=None,
+        start_index=None,
+        finish_index=None,
+        return_latents=False,
+        style_mix=False,
+        input_is_latent=False,
+        random_content=False,
+        inject_index=None
+        # optimize_style_latent=False,
+    ):  
+        content = self.content_encoder(content)
+        styles = [self.style_encoder(styles)]
+        
+        # style mapping network
+        if not input_is_latent:
+            styles = [self.style(s) for s in styles]
+
+        if style_mix:
+            t_styles = [self.style(t) for t in target_styles]
+            styles +=t_styles
+
+        if len(styles) < 2:
+            inject_index = self.n_latent
+
+            if styles[0].ndim < 3:
+                latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
+
+            else:
+                latent = styles[0]
+
+        else:
+            if inject_index is None:
+                inject_index = random.randint(1, self.n_latent - 1)
+
+            latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
+            latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
+
+            latent = torch.cat([latent, latent2], 1)
+        """
+        if len(styles) < 2:
+            start_index = self.n_latent
+
+            if styles[0].ndim < 3:
+                latent = styles[0].unsqueeze(1).repeat(1, start_index, 1)
+
+            else:
+                latent = styles[0]
+
+        else:
+            if start_index is None:
+                start_index = random.randint(1, self.n_latent - 1) 
+            # self.n_latent=14
+            if not finish_index: 
+                latent = styles[0].unsqueeze(1).repeat(1, start_index, 1)
+                latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - start_index, 1)
+
+                latent = torch.cat([latent, latent2], 1)
+            else:
+                latent = styles[0].unsqueeze(1).repeat(1, start_index, 1)
+                latent2 = styles[1].unsqueeze(1).repeat(1, finish_index - start_index + 1, 1)
+                latent3 = styles[0].unsqueeze(1).repeat(1, self.n_latent - finish_index - 1, 1)
+
+                latent = torch.cat([latent, latent2], 1)
+                latent = torch.cat([latent, latent3], 1)
+
+        if random_content==True: # content encoder 사용x, random content로 train
+            out = self.input(content)
+        else: #content encoder 사용
+        """
+        out = self.input(content) 
+        # block1
+        out = self.conv1(out, latent[:, 0])
+        skip = self.to_rgb1(out, latent[:, 1])
+
+        i = 1
+        for conv1, conv2, to_rgb in zip(
+            self.convs[::2], self.convs[1::2], self.to_rgbs
+        ):
+            out = conv1(out, latent[:, i])
+            out = conv2(out, latent[:, i + 1])
+            skip = to_rgb(out, latent[:, i + 2], skip)
+            i += 2
+
+        image = skip
+
+        if return_latents:
+            return image, latent
+        elif style_mix:
+            return image, None
+        else:
+            return image, None
+
+#run current code
+if __name__ == "__main__":
+    # test_encoder = Content_Encoder(input_channel=3)
+
+    # test_img = torch.randn(1, 3, 256, 64)
+
+    # output = test_encoder(test_img)
+
+    # test_generator = Generator()
+    # print(output.shape)
+
+
+    test_encoder = Content_Encoder(input_channel=3)
+    test_generator = Generator()
+
+    content_img = torch.randn(1,3,64,256)
+    content_img = F.resize(content_img, (256,256))
+
+
+    content_latent = test_encoder(content_img)
+
+
+    style = torch.ones(1,1,512)
+
+    output = test_generator(content_latent, style)
+
+    print(output.shape)
+    print('done')
+
+    
