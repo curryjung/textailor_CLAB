@@ -2,17 +2,20 @@ import argparse
 import math
 import random
 import os
+import numpy as np
+from PIL import Image, ImageFont, ImageDraw
+
+from os.path import join as ospj
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
-import numpy as np
 import torch
 from torch import nn, autograd, optim
 from torch.nn import functional as F
 from torch.utils import data
-import torch.distributed as dist
-from torchvision import transforms, utils
+from torchvision import transforms
+from torchvision import utils as tvutils
 from tqdm import tqdm
-
+from torchvision.transforms import functional
 try:
     import wandb
 
@@ -30,7 +33,7 @@ from distributed import (
 from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
-from torch.utils.tensorboard import SummaryWriter
+from logger import TBLogger
 
 
 def data_sampler(dataset, shuffle, distributed):
@@ -125,11 +128,17 @@ def set_grad_none(model, targets):
             p.grad = None
 
 
+def c_loss(preds1, preds2):
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
+    loss = criterion(preds1.view(-1, preds1.shape[-1]), preds2.contiguous().view(-1))
+    return loss
+
+
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
     loader = sample_data(loader)
-
-    if args.tensor:
-        writer = SummaryWriter()
+    writer = TBLogger(args.dname_logger, args.dir_name)
+    os.makedirs(ospj(writer.log_dir, 'samples'), exist_ok=True)
+    os.makedirs(ospj(writer.log_dir, 'checkpoints'), exist_ok=True)
 
     pbar = range(args.iter)
 
@@ -161,26 +170,84 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
 
-    sample_z = torch.randn(args.n_sample, args.latent, device=device)
-    sample_c = torch.randn(args.n_sample, 16, device=device)
+    ex_img, gray_text_img_ex, label = next(loader)
+    ex_img = ex_img.to(device)
+    ex_img_resize = functional.resize(ex_img, (256, 256))
+    tvutils.save_image(
+        ex_img,
+        f'{writer.log_dir}/samples/style_fixed.png',
+        nrow=1,
+        normalize=True,
+        range=(-1, 1),
+    )
+
+    # c_image = input content image
+    image = Image.open('./gray_text/result/EARTH.png')
+    tf = transforms.ToTensor()
+    c_image = tf(image)  # c_image shape = [1,64,256]
+    c_demo_image = c_image.unsqueeze(dim=0)  # shape [1,3,64,256]
+    if not args.content_resnet:
+        c_demo_image_gray = functional.rgb_to_grayscale(c_demo_image)
+    else:
+        c_demo_image_gray = c_demo_image
+    tvutils.save_image(
+        c_demo_image_gray,
+        f'{writer.log_dir}/samples/content_fixed.png',
+        nrow=1,
+        normalize=True,
+        range=(-1, 1),
+                    )
+    c_demo_image_gray = c_demo_image_gray.to(device)
+    c_demo_image_gray = c_demo_image_gray.repeat(args.batch, 1, 1, 1)
+
+    fixed_z = torch.randn(4, args.latent, device=device)
+
+    var_dic = {}
+    var_dic['random'] = []
+    var_dic['encoder'] = []
 
     for idx in pbar:
         i = idx + args.start_iter
 
         if i > args.iter:
             print("Done!")
-
             break
 
-        real_img = next(loader)
+        # gray_text_img shape=[batch,1,64,256]
+        # real_img shape=[batch,3,64,256]
+        real_img, gray_text_img, label = next(loader)
+
+        # variance analysis
+        if args.return_var:
+            requires_grad(generator, False)
+            requires_grad(discriminator, False)
+            real_img = real_img.to(device)
+            real_img_resize = functional.resize(real_img, (256, 256))
+
+            gray_text_img = gray_text_img.to(device)
+
+            # style encoder 나온 image
+            _, var_encoder = generator(gray_text_img, real_img_resize, return_var=True)
+
+            # random noise로 만든 image
+            noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+            _, var_random = generator(gray_text_img, noise, random_style=True, return_var=True)
+
+            var_dic['random'].append(var_encoder)
+            var_dic['encoder'].append(var_random)
+
+            continue
+
         real_img = real_img.to(device)
+        real_img_resize = functional.resize(real_img, (256, 256))
+
+        gray_text_img = gray_text_img.to(device)
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
-        content = torch.randn(args.batch, 16, device=device)
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(content, noise)
+        # style encoder 나온 image
+        fake_img, _ = generator(gray_text_img, real_img_resize)
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -189,22 +256,29 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         else:
             real_img_aug = real_img
 
-        # fake img,real img shape [4,3,64,256]
         fake_pred = discriminator(fake_img)
         real_pred = discriminator(real_img_aug)
         d_loss = d_logistic_loss(real_pred, fake_pred)
 
-        loss_dict["d"] = d_loss
-        loss_dict["real_score"] = real_pred.mean()
-        loss_dict["fake_score"] = fake_pred.mean()
+        discriminator.zero_grad()
+        d_loss.backward()
+        d_optim.step()
+
+        # random noise로 만든 image
+        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        fake_img, _ = generator(gray_text_img, noise, random_style=True)
+
+        fake_pred = discriminator(fake_img)
+        real_pred = discriminator(real_img_aug)
+        d_loss = d_logistic_loss(real_pred, fake_pred)
 
         discriminator.zero_grad()
         d_loss.backward()
-
-        if args.tensor:
-            writer.add_scalar("Loss/d_loss", d_loss, idx)
-
         d_optim.step()
+
+        loss_dict["d"] = d_loss
+        loss_dict["real_score"] = real_pred.mean()
+        loss_dict["fake_score"] = fake_pred.mean()
 
         if args.augment and args.augment_p == 0:
             ada_aug_p = ada_augment.tune(real_pred)
@@ -217,7 +291,6 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
             if args.augment:
                 real_img_aug, _ = augment(real_img, ada_aug_p)
-
             else:
                 real_img_aug = real_img
 
@@ -231,60 +304,98 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         loss_dict["r1"] = r1_loss
 
+        # G train
+        # style encoder로 만든 image
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        content = torch.randn(args.batch, args.latent, device=device)
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-
-        fake_img, _ = generator(content, noise)
+        fake_refguided, _ = generator(gray_text_img, real_img_resize)
 
         if args.augment:
-            fake_img, _ = augment(fake_img, ada_aug_p)
+            fake_refguided, _ = augment(fake_refguided, ada_aug_p)
 
-        fake_pred = discriminator(fake_img)
+        fake_pred = discriminator(fake_refguided)
         g_loss = g_nonsaturating_loss(fake_pred)
 
-        loss_dict["g"] = g_loss
+        fake_refguided, _ = generator(gray_text_img, real_img_resize)
+
+        """
+        # OCR 특수문자 인식 X, 대문자 to 소문자, 25개 미만 글자
+        label = [l.lower() for l in label]
+        #label = [l.translate(str.maketrans('', '', string.punctuation)) for l in label]
+        new_label = []
+        for k in label:
+            for j in k:
+                if not j in args.character:
+                    k = k.replace(j,'')
+            if len(k) > 25:
+                k = k[:25]
+            new_label.append(k)
+
+        closs_preds, closs_target , pred = ocr_pred(fake_img_gray, new_label, predict_text=True)
+
+        ocr_loss = c_loss(closs_preds, closs_target)
+        ocr_loss.requires_grad=True
+        """
+        # image recon loss(논문)
+        recon_image = F.mse_loss(fake_refguided, real_img)
+
+        # latent recon loss
+        orig_latent = generator(gray_text_img, real_img_resize, latent_recon=True)  # real image 넣어서 style encoder latent
+        latent_recon_img = functional.resize(fake_refguided, (256, 256))
+        fake_latent = generator(gray_text_img, latent_recon_img, latent_recon=True)  # fake image 넣어서 style encoder latent
+        recon_latent = F.mse_loss(orig_latent, fake_latent)
+
+        # diversity sensitive loss
+
+        g_loss = g_loss + args.recon_factor * recon_image
+        # g_loss = g_loss + args.recon_factor * recon_image + ocr_loss
+        # g_loss = g_loss + ocr_loss
 
         generator.zero_grad()
         g_loss.backward()
-
-        if args.tensor:
-            writer.add_scalar("Loss/g_loss", g_loss, idx)
-        
         g_optim.step()
+
+        # random noise로 만든 image
+        fake_img_latentguided, _ = generator(gray_text_img, noise, random_style=True)
+
+        fake_pred = discriminator(fake_img_latentguided)
+        g_loss = g_nonsaturating_loss(fake_pred)
+
+        generator.zero_grad()
+        g_loss.backward()
+        g_optim.step()
+
+        loss_dict["path"] = path_loss
+        loss_dict["path_length"] = path_lengths.mean()
 
         g_regularize = i % args.g_reg_every == 0
 
         if g_regularize:
-            path_batch_size = max(1, args.batch // args.path_batch_shrink)
-
-            content = torch.randn(args.batch, 16, device=device)
-            noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-
-            fake_img, latents = generator(content, noise, return_latents=True)
+            fake_img_latentguided, latents = generator(gray_text_img, noise, random_style=True, return_latents=True)
+            # fake_img, latents = generator(gray_text_img, real_img_resize, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
-                fake_img, latents, mean_path_length
+                fake_img_latentguided, latents, mean_path_length
             )
 
             generator.zero_grad()
             weighted_path_loss = args.path_regularize * args.g_reg_every * path_loss
 
             if args.path_batch_shrink:
-                weighted_path_loss += 0 * fake_img[0, 0, 0, 0]
+                weighted_path_loss += 0 * fake_img_latentguided[0, 0, 0, 0]
 
             weighted_path_loss.backward()
-
             g_optim.step()
 
             mean_path_length_avg = (
                 reduce_sum(mean_path_length).item() / get_world_size()
             )
 
-        loss_dict["path"] = path_loss
-        loss_dict["path_length"] = path_lengths.mean()
+        loss_dict["recon_image"] = recon_image
+        loss_dict["recon_latent"] = recon_latent
+        # loss_dict["ocr_loss"] = ocr_loss
+        loss_dict["g"] = g_loss
 
         accumulate(g_ema, g_module, accum)
 
@@ -299,13 +410,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         path_length_val = loss_reduced["path_length"].mean().item()
 
         if get_rank() == 0:
-            pbar.set_description(
-                (
+            pbar.set_description((
                     f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
                     f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
                     f"augment: {ada_aug_p:.4f}"
-                )
-            )
+            ))
 
             if wandb and args.wandb:
                 wandb.log(
@@ -323,31 +432,58 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
 
-            if i % args.save_freq == 0:
+            if i % args.log_every == 0:
+                # writer.log_metrics({"Loss/ocr_loss": ocr_loss,
+                writer.log_metrics({"Loss/d_loss": d_loss,
+                                    "Loss/recon_l2_loss": recon_image,
+                                    "Loss/g_loss": g_loss,
+                                    "Loss/recon_latent": recon_latent}, idx)
+
+            if i % args.image_every == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    sample, _ = g_ema(sample_c,[sample_z])
-                    utils.save_image(
-                        sample,
-                        f"sample/{str(i).zfill(6)}.png",
-                        nrow=int(args.n_sample ** 0.5),
-                        normalize=True,
-                        range=(-1, 1),
-                    )
+                    t_fake_img_fixedz, _ = g_ema(c_demo_image_gray, [fixed_z], random_style=True)
+                    t_fake_img_fixedref, _ = g_ema(c_demo_image_gray, ex_img_resize)
 
-            if i % 10000 == 0:
-                torch.save(
-                    {
-                        "g": g_module.state_dict(),
-                        "d": d_module.state_dict(),
-                        "g_ema": g_ema.state_dict(),
-                        "g_optim": g_optim.state_dict(),
-                        "d_optim": d_optim.state_dict(),
-                        "args": args,
-                        "ada_aug_p": ada_aug_p,
-                    },
-                    f"checkpoint/{str(i).zfill(6)}.pt",
-                )
+                    width_cell = real_img.shape[3]
+                    images = [real_img, gray_text_img, fake_refguided, fake_img_latentguided, t_fake_img_fixedz, t_fake_img_fixedref]
+                    images = [tvutils.make_grid(image, nrow=1, normalize=True, value_range=(-1, 1)) for image in images]
+                    images = torch.cat(images, axis=2) * 255
+                    images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
+                    H, W, C = images.shape
+
+                    canvas_height = 30
+                    canvas = np.ones((canvas_height, W, C), images.dtype) * 255
+                    font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+                    canvas = Image.fromarray(canvas)
+                    draw = ImageDraw.Draw(canvas)
+                    padding = 5
+                    centering = 50
+                    words = 'real,content,train_refguided,train_latentguided,fixedz,fixedref'.split(',')
+                    for iw, word in enumerate(words):
+                        offset = iw * (width_cell + padding) + centering
+                        draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+                    images = np.concatenate([images, np.array(canvas)], axis=0)
+                    images = Image.fromarray(images)
+                    images.save(f'{writer.log_dir}/samples/{str(i).zfill(6)}.png')
+
+            if i % args.ckpt_every == 0:
+                torch.save({"g": g_module.state_dict(),
+                            "d": d_module.state_dict(),
+                            "g_ema": g_ema.state_dict(),
+                            "g_optim": g_optim.state_dict(),
+                            "d_optim": d_optim.state_dict(),
+                            "args": args,
+                            "ada_aug_p": ada_aug_p,
+                            },
+                           f'{writer.log_dir}/checkpoints/{str(i).zfill(6)}.ckpt',
+                           )
+
+    if args.return_var:
+        total_random_var = torch.cat(var_dic['random']).mean()
+        total_encoder_var = torch.cat(var_dic['encoder']).mean()
+        print(f"random_var : {total_random_var}, encoder_var : {total_encoder_var}")
+        print("done!")
 
 
 if __name__ == "__main__":
@@ -355,139 +491,71 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("--path", type=str, default = '/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/', help="path to the lmdb dataset")
+    parser.add_argument("--dataset_dir", type=str, default='/datasets/IMGUR5K-Handwriting-Dataset', help='datset directory')
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
-    parser.add_argument(
-        "--iter", type=int, default=800000, help="total training iterations"
-    )
-    parser.add_argument(
-        "--batch", type=int, default=16, help="batch sizes for each gpus"
-    )
-    parser.add_argument(
-        "--n_sample",
-        type=int,
-        default=64,
-        help="number of the samples generated during training",
-    )
-    parser.add_argument(
-        "--save_freq",
-        type=int,
-        default=1000,
-        help="save frequency",
-    )
-    parser.add_argument(
-        "--size", type=int, default=256, help="image sizes for the model"
-    )
-    parser.add_argument(
-        "--r1", type=float, default=10, help="weight of the r1 regularization"
-    )
-    parser.add_argument(
-        "--path_regularize",
-        type=float,
-        default=2,
-        help="weight of the path length regularization",
-    )
-    parser.add_argument(
-        "--path_batch_shrink",
-        type=int,
-        default=2,
-        help="batch size reducing factor for the path length regularization (reduce memory consumption)",
-    )
-    parser.add_argument(
-        "--d_reg_every",
-        type=int,
-        default=16,
-        help="interval of the applying r1 regularization",
-    )
-    parser.add_argument(
-        "--g_reg_every",
-        type=int,
-        default=4,
-        help="interval of the applying path length regularization",
-    )
-    parser.add_argument(
-        "--mixing", type=float, default=0.9, help="probability of latent code mixing"
-    )
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default=None,
-        help="path to the checkpoints to resume training",
-    )
+    parser.add_argument('--dname_logger', type=str, default='exp_logs', help='root directory for logger')
+    parser.add_argument('--dir_name', type=str, default='hi', help='저장 이름')
+    parser.add_argument("--iter", type=int, default=800000, help="total training iterations")
+    parser.add_argument("--batch", type=int, default=4, help="batch sizes for each gpus")
+    parser.add_argument("--n_sample", type=int, default=8, help="number of the samples generated during training",)
+    parser.add_argument("--size", type=int, default=256, help="image sizes for the model")
+    parser.add_argument("--r1", type=float, default=10, help="weight of the r1 regularization")
+    parser.add_argument("--path_regularize", type=float, default=2, help="weight of the path length regularization",)
+    parser.add_argument("--path_batch_shrink", type=int, default=2,
+                        help="batch size reducing factor for the path length regularization (reduce memory consumption)",)
+    parser.add_argument("--d_reg_every", type=int, default=16, help="interval of the applying r1 regularization",)
+    parser.add_argument("--g_reg_every", type=int, default=4, help="interval of the applying path length regularization",)
+    parser.add_argument("--mixing", type=float, default=0.9, help="probability of latent code mixing")
+    parser.add_argument("--ckpt", type=str, default=None, help="path to the checkpoints to resume training",)
     parser.add_argument("--lr", type=float, default=0.002, help="learning rate")
-    parser.add_argument(
-        "--channel_multiplier",
-        type=int,
-        default=2,
-        help="channel multiplier factor for the model. config-f = 2, else = 1",
-    )
-    parser.add_argument(
-        "--wandb", action="store_true", help="use weights and biases logging"
-    )
-    parser.add_argument(
-        "--tensor", action="store_true", help="tensorboard"
-    )
-    parser.add_argument(
-        "--local_rank", type=int, default=0, help="local rank for distributed training"
-    )
-    parser.add_argument(
-        "--augment", action="store_true", help="apply non leaking augmentation"
-    )
-    parser.add_argument(
-        "--augment_p",
-        type=float,
-        default=0,
-        help="probability of applying augmentation. 0 = use adaptive augmentation",
-    )
-    parser.add_argument(
-        "--ada_target",
-        type=float,
-        default=0.6,
-        help="target augmentation probability for adaptive augmentation",
-    )
-    parser.add_argument(
-        "--ada_length",
-        type=int,
-        default=500 * 1000,
-        help="target duraing to reach augmentation probability for adaptive augmentation",
-    )
-    parser.add_argument(
-        "--ada_every",
-        type=int,
-        default=256,
-        help="probability update interval of the adaptive augmentation",
-    )
+    parser.add_argument("--channel_multiplier", type=int, default=2, help="channel multiplier factor for the model. config-f = 2, else = 1",)
+    parser.add_argument("--wandb", action="store_true", help="use weights and biases logging")
+    parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
+    parser.add_argument("--augment", action="store_true", help="apply non leaking augmentation")
+    parser.add_argument("--freeze", action="store_true", help="generator/discriminator freeze")
+    parser.add_argument("--augment_p", type=float, default=0, help="probability of applying augmentation. 0 = use adaptive augmentation",)
+    parser.add_argument("--ada_target", type=float, default=0.6, help="target augmentation probability for adaptive augmentation",)
+    parser.add_argument("--recon_factor", type=float, default=10.0, help="reconstruction loss facator",)
+    parser.add_argument("--ada_length", type=int, default=500 * 1000,
+                        help="target duraing to reach augmentation probability for adaptive augmentation",)
+    parser.add_argument("--ada_every", type=int, default=256, help="probability update interval of the adaptive augmentation",)
+    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--image_every", type=int, default=50, help="save images every",)
+    parser.add_argument("--ckpt_every", type=int, default=10000, help="save checkpoints every",)
+    parser.add_argument("--train_store", action="store_true")
+
+    parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
+    parser.add_argument('--ocr_batch_size', type=int, default=192, help='input batch size')
+
+    """ Analysis """
+    parser.add_argument('--return_var', action='store_true', help='return_var')
 
     args = parser.parse_args()
+    args.content_resnet = True
 
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = n_gpu > 1
 
     if args.distributed:
+        print("distributed 성공")
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
+
+    print('Count of using GPUs:', torch.cuda.device_count())
 
     args.latent = 512
     args.n_mlp = 8
 
     args.start_iter = 0
 
-    if args.arch == 'stylegan2':
-        from model import Generator, Discriminator
+    from model import Generator, Discriminator
 
-    elif args.arch == 'swagan':
-        from swagan import Generator, Discriminator
-
-    generator = Generator(
-    ).to(device)
-    discriminator = Discriminator(
-        channel_multiplier=args.channel_multiplier
-    ).to(device)
-    g_ema = Generator(
-    ).to(device)
+    generator = Generator().to(device)
+    discriminator = Discriminator(channel_multiplier=args.channel_multiplier).to(device)
+    g_ema = Generator().to(device)
     g_ema.eval()
-    #accumulate(g_ema, generator, 0)
+    accumulate(g_ema, generator, 0)
 
     g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
     d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
@@ -537,7 +605,15 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-    dataset = IMGUR5K_Handwriting(args.path)
+    img_folder = args.dataset_dir+'/preprocessed'
+    label_path = args.dataset_dir+'/label_dic.json'
+    gray_text_folder = args.dataset_dir+'/gray_text'
+
+    # dataset = IMGUR5K_Handwriting(args.img_folder, args.test_label_path, args.gray_text_folder, train=True)
+    if args.content_resnet:
+        dataset = IMGUR5K_Handwriting(img_folder, label_path, gray_text_folder, train=True, content_resnet=True)
+    else:
+        dataset = IMGUR5K_Handwriting(img_folder, label_path, gray_text_folder, train=True)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
@@ -547,6 +623,4 @@ if __name__ == "__main__":
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
-    print(discriminator)
     train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
-
