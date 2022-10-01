@@ -15,7 +15,7 @@ from tqdm import tqdm
 import torchvision.transforms.functional as Function
 
 
-from model import Encoder, another_Encoder, Generator, Discriminator
+from model import Encoder, Style_Encoder, Generator, Discriminator
 from dataset import IMGUR5K_Handwriting
 
 from torch.utils.tensorboard import SummaryWriter
@@ -121,10 +121,11 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
     
     sample_c = torch.randn(args.n_sample, 16, device=device)
 
-    samples = next(loader)
-    samples_enc = Function.resize(samples, (256,256))
+    samples,_,_ = next(loader)
+    print(samples.shape)
+    #samples_enc = Function.resize(samples, (256,256))
     samples = samples.to(device)
-    samples_enc = samples_enc.to(device)
+    #samples_enc = samples_enc.to(device)
     
     for idx in pbar:
         i = idx + args.start_iter
@@ -133,7 +134,7 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
             print("Done!")
 
             break
-        real_img_enc = next(loader)
+        real_img_enc,_,_ = next(loader)
         real_img_enc = real_img_enc.to(device)
 
         # E update
@@ -145,7 +146,7 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
 
         latents = encoder(real_img_enc)
         content = torch.randn(args.batch, 16, device=device)
-        recon_img, _ = generator(content, [latents])
+        recon_img = generator(content, [latents])
 
         #recon_vgg_loss = vgg_loss(recon_img, real_img_dis)
         #loss_dict["vgg"] = recon_vgg_loss * args.vgg
@@ -212,8 +213,10 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--path", type=str, default='/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/')
-    parser.add_argument("--g_ckpt", type=str, default='./checkpoint/100000.pt')
+    parser.add_argument("--img_folder", type=str, default = '/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/', help="path to the lmdb dataset")
+    parser.add_argument("--test_label_path", type=str, default = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/label_dic.json")
+    parser.add_argument("--gray_text_folder", type=str, default = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/gray_text")
+    parser.add_argument("--g_ckpt", type=str, default='./checkpoint/encoder_000000.pt')
     parser.add_argument("--e_ckpt", type=str, default=None)
 
     parser.add_argument("--device", type=str, default='cuda')
@@ -248,7 +251,7 @@ if __name__ == "__main__":
     
     generator = Generator().to(device)
     discriminator = Discriminator(channel_multiplier=args.channel_multiplier).to(device)
-    encoder = another_Encoder().to(device)
+    encoder = Style_Encoder().to(device)
 
     e_optim = optim.Adam(
         encoder.parameters(),
@@ -261,11 +264,11 @@ if __name__ == "__main__":
         lr=args.lr,
         betas=(0.9, 0.99),
     )
-    
+    """
     generator.load_state_dict(g_ckpt["g_ema"])
     discriminator.load_state_dict(g_ckpt["d"])
     d_optim.load_state_dict(g_ckpt["d_optim"])
-    
+    """
     if args.e_ckpt is not None:
         print("resume training:", args.e_ckpt)
         e_ckpt = torch.load(args.e_ckpt, map_location=lambda storage, loc: storage)
@@ -289,7 +292,7 @@ if __name__ == "__main__":
         ]
     )
 
-    dataset = IMGUR5K_Handwriting(args.path)
+    dataset = IMGUR5K_Handwriting(args.img_folder, args.test_label_path, args.gray_text_folder, train=True)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,

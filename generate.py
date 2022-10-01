@@ -2,9 +2,11 @@ import argparse
 
 import torch
 from torchvision import utils
-from model import Generator
+# from model import Generator
+from model_previous import Generator
 from tqdm import tqdm
 import json
+import os
 
 
 def generate(args, g_ema, device, mean_latent):
@@ -43,11 +45,7 @@ def generate(args, g_ema, device, mean_latent):
 
                     with open('/home/sy/textailor_CLAB/w_mean_std.json', 'w') as f:
                         json.dump(w_mean_std_dic, f)
-                    
-
-        
-                    
-
+                
                 if not args.save_w_std:
                     utils.save_image(
                         sample,
@@ -104,12 +102,43 @@ def generate(args, g_ema, device, mean_latent):
                 )
                 
 
+def generate_fake_samples(args, g_ema, device, mean_latent):
 
+    if not os.path.exists(args.save_dir):   
+        os.makedirs(args.save_dir)
+
+    with torch.no_grad():
+        g_ema.eval()
+
+        img_cnt = 0
+        for i in tqdm(range(args.pics)):
+            sample_z = torch.randn(args.sample, args.latent, device=device) #styles
+            sample_c = torch.randn(args.sample, 16, device=device) #content
+
+            sample, _ = g_ema(
+                sample_c, [sample_z]
+            )
+
+            #save sample separately, not in a grid
+            #For example, if you want to save 1000 samples, you need to save 1000 images.
+
+            for j in range(args.sample):
+                utils.save_image(
+                    sample[j],
+                    f"{args.save_dir}/{str(img_cnt)}.png",
+                    nrow=1,
+                    normalize=True,
+                    range=(-1, 1),
+                )
+                img_cnt += 1
 
 if __name__ == "__main__":
     device = "cuda"
 
     parser = argparse.ArgumentParser(description="Generate samples from the generator")
+
+    parser.add_argument("--run_generate", action="store_true", help="generate samples")
+    parser.add_argument("--run_generate_fake_samples", action="store_true", help="generate fake samples")
 
     parser.add_argument(
         "--size", type=int, default=1024, help="output image size of the generator"
@@ -149,6 +178,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save_w_std",type=bool, default=True,
     )
+    parser.add_argument(
+        "--save_dir",type=str, default="/home/sy/textailor_CLAB/result/fake_samples",
+    )
 
 
     args = parser.parse_args()
@@ -166,4 +198,11 @@ if __name__ == "__main__":
     else:
         mean_latent = None
 
-    generate(args, g_ema, device, mean_latent)
+    if args.run_generate:
+        generate(args, g_ema, device, mean_latent)
+    elif args.run_generate_fake_samples:
+        generate_fake_samples(args, g_ema, device, mean_latent)
+    
+
+
+

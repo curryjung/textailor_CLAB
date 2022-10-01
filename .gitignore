@@ -1,5 +1,7 @@
 *.pt
 
+__pycache__
+op
 checkpoint/
 datasets/
 sample/

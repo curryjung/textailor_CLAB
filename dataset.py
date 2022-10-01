@@ -8,13 +8,21 @@ import numpy as np
 import cv2
 import copy
 from torchvision import transforms
+from torchvision.utils import make_grid, save_image
+from tqdm import tqdm
+from PIL import Image
+from PIL import ImageDraw
 
 class IMGUR5K_Handwriting(Dataset):
-    def __init__(self, img_folder, label_path=None, train=True, transform=None):
+    def __init__(self, img_folder, label_path=None, gray_text_folder=None,train=True, content_resnet=False, transform=None):
         assert os.path.exists(img_folder), "img_folder does not exist"
         
         self.img_folder = img_folder
+        self.label_path = label_path
+        self.gray_text_folder = gray_text_folder
         self.img_list = os.listdir(img_folder)
+        if gray_text_folder is not None:
+           self.gray_list = os.listdir(gray_text_folder)
         if label_path is not None:
             assert os.path.exists(label_path), "label_path does not exist"
 
@@ -23,6 +31,7 @@ class IMGUR5K_Handwriting(Dataset):
             self.label_dic = None
 
         self.train = train
+        self.content_resnet = content_resnet
         
         if transform is None:
             self.transform = transforms.Compose([
@@ -32,6 +41,12 @@ class IMGUR5K_Handwriting(Dataset):
             ])
         else:
             self.transform = transform
+
+        self.gray_transform =  transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Resize((64,256)), 
+                transforms.Normalize((0.5,), (0.5,))
+            ])
 
 
 
@@ -44,6 +59,8 @@ class IMGUR5K_Handwriting(Dataset):
         return len(self.img_list)
 
     def __getitem__(self, index):
+        
+        # get style image
         img_name = self.img_list[index]
         img_id = img_name.split('.')[0]
         
@@ -51,11 +68,24 @@ class IMGUR5K_Handwriting(Dataset):
 
         img = self.transform(img)
 
+        # get gray text image
+        # gray_name = self.gray_list[index]
+        if self.gray_text_folder is not None:
+            gray_text_img_name = os.path.join(self.gray_text_folder, img_id+".png")
+            if self.content_resnet==False:
+                gray_text_img = cv2.imread(gray_text_img_name, cv2.IMREAD_GRAYSCALE)
+                gray_text_img = self.gray_transform(gray_text_img)
+            else:
+                gray_text_img = cv2.imread(gray_text_img_name)
+                gray_text_img = self.transform(gray_text_img)
+        else:
+            gray_text_img = None
+            
         if self.label_dic is not None:
             label = self.label_dic[img_id]
-            return img, label
+            return img, gray_text_img, label
         else:
-            return img
+            return img, gray_text_img
 
         
 
@@ -94,17 +124,50 @@ class MultiResolutionDataset(Dataset):
         return img
 
 
-if __name__=="__main__":
-    img_folder = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/images"
-    # test_label_path = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/dataset_info/imgur5k_annotations.json"
-    label_path = None
-    dataset = IMGUR5K_Handwriting(img_folder, label_path, train=True)
+def draw_text_on_image():
+    dst_dir = "run_js/dataset_test"
+    if not os.path.exists(dst_dir):
+        os.makedirs(dst_dir)
 
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=0)
+    img_folder = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed"
+    test_label_path = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/label_dic.json"
+    gray_text_folder = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/gray_text"
 
-    for i, (img) in enumerate(dataloader):
-        print(img.shape)
-        # print(label)
-        if i == 0:
+    batch_size=1
+    dataset = IMGUR5K_Handwriting(img_folder, test_label_path, gray_text_folder,train=True)
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    pbar = tqdm(dataloader)
+    for i, (imgs, gray_imgs, labels) in enumerate(pbar):
+        if i == 500:
             break
+        
+        imgs = (imgs + 1)/2
+        #torch to pil
+        pil_img = transforms.ToPILImage()(imgs[0])
+        canvas = ImageDraw.Draw(pil_img)
+        try:
+            canvas.text((28,36), labels[0], fill=(0,0,0))
+        except:
+            continue
+        pil_img.save("run_js/dataset_test/{}.png".format(i))
+
+
+    
+
+if __name__=="__main__":
+    # img_folder = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed"
+    # test_label_path = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/label_dic.json"
+    # gray_text_folder = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/gray_text"
+
+    # batch_size=16
+    # dataset = IMGUR5K_Handwriting(img_folder, test_label_path, gray_text_folder,train=True)
+
+    # dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    # pbar = tqdm(dataloader)
+    # for i, (imgs, gray_imgs, labels) in enumerate(pbar):
+    #     pbar.set_description(desc=f"imgs.shape: {imgs.shape}, gray_imgs.shape: {gray_imgs.shape}, len(labels): {len(labels)}")
+    draw_text_on_image()
+
+        
 

@@ -8,8 +8,10 @@ from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Function
 from torchvision.ops import RoIAlign
+from torchvision import models
 from torchvision.models import resnet50
-from torchvision.transforms import functional as F
+from torch.nn import functional as F
+from torchvision.models.resnet import BasicBlock
 
 
 from op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d, conv2d_gradfix
@@ -471,7 +473,7 @@ class Origin_ConvLayer(nn.Sequential):
                 bias=bias# and not activate,
             )
         )
-
+        "변경"
         if activate:
             layers.append(FusedLeakyReLU(out_channel, bias=bias))
 
@@ -663,7 +665,6 @@ class ImageToLatent(torch.nn.Module):
 
         return x
 
-
 class Style_Encoder(nn.Module):
     def __init__(self, w_dim=512):
         super().__init__()
@@ -765,6 +766,104 @@ class Content_Encoder(nn.Module):
         out = self.convs(input) #out shape:[1,512,4,16]
         return out
 
+#---------------------------------------------------------------
+# tsb 구현 레포의 content encoder, style encoder, mapping network
+
+class ContentResnet(models.ResNet):
+    def __init__(self):
+        # resnet18 init
+        super().__init__(BasicBlock, [2, 2, 2, 2])
+
+    def _forward_impl(self, x):
+        # See note [TorchScript super()]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        #x = self.avgpool(x)
+        #x = torch.flatten(x, 1)
+        #x = self.fc(x)
+
+        return x
+
+class StyleResnet(models.ResNet):
+    def __init__(self):
+        # resnet18 init
+        super().__init__(BasicBlock, [2, 2, 2, 2])
+        self.fc = torch.nn.Identity()
+
+class ScaleW:
+    '''
+    Constructor: name - name of attribute to be scaled
+    '''
+    def __init__(self, name):
+        self.name = name
+    
+    def scale(self, module):
+        weight = getattr(module, self.name + '_orig')
+        fan_in = weight.data.size(1) * weight.data[0][0].numel()
+        
+        return weight * math.sqrt(2 / fan_in)
+    
+    @staticmethod
+    def apply(module, name):
+        '''
+        Apply runtime scaling to specific module
+        '''
+        hook = ScaleW(name)
+        weight = getattr(module, name)
+        module.register_parameter(name + '_orig', nn.Parameter(weight.data))
+        del module._parameters[name]
+        module.register_forward_pre_hook(hook)
+    
+    def __call__(self, module, whatever):
+        weight = self.scale(module)
+        setattr(module, self.name, weight)
+
+# Quick apply for scaled weight
+def quick_scale(module, name='weight'):
+    ScaleW.apply(module, name)
+    return module
+
+class SLinear(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+
+        linear = nn.Linear(dim_in, dim_out)
+        linear.weight.data.normal_()
+        linear.bias.data.zero_()
+        
+        self.linear = quick_scale(linear)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class Intermediate_Generator(nn.Module):
+    '''
+    A mapping consists of multiple fully connected layers.
+    Used to map the input to an intermediate latent space W.
+    '''
+    def __init__(self, dim_latent):
+        super().__init__()
+        layers = [PixelNorm()]
+        layers.append(SLinear(dim_latent, dim_latent))
+        layers.append(nn.LeakyReLU(0.2))
+        layers.append(SLinear(dim_latent, dim_latent))
+        layers.append(nn.LeakyReLU(0.2))
+            
+        self.mapping = nn.Sequential(*layers)
+    
+    def forward(self, latent_z):
+        latent_w = self.mapping(latent_z.squeeze())
+        return latent_w    
+#---------------------------------------------------------------
 
 class Generator(nn.Module):
     def __init__(
@@ -793,8 +892,8 @@ class Generator(nn.Module):
         self.style = nn.Sequential(*layers)
         style_dim = 512
 
-        self.style_encoder = Style_Encoder() #style encoder
-        self.content_encoder = Content_Encoder() # content encoder
+        self.style_encoder = StyleResnet() #style encoder
+        self.content_encoder = ContentResnet() # content encoder
         
         self.input = ConstantInput(512)
         # block 1
@@ -848,15 +947,24 @@ class Generator(nn.Module):
         start_index=None,
         finish_index=None,
         return_latents=False,
+        return_styles=False,
         style_mix=False,
         input_is_latent=False,
-        random_content=False,
-        inject_index=None
+        random_style=False,
+        inject_index=None,
+        latent_recon=False,
+        return_var=False,
         # optimize_style_latent=False,
     ):  
         content = self.content_encoder(content)
-        styles = [self.style_encoder(styles)]
-        
+        if random_style==False:
+            styles = [self.style_encoder(styles)]
+        else:
+            styles = styles
+        re_latent = styles[0]
+
+        if return_var:
+            var_tmp = torch.var(styles[0],axis=1)
         # style mapping network
         if not input_is_latent:
             styles = [self.style(s) for s in styles]
@@ -882,6 +990,7 @@ class Generator(nn.Module):
             latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
 
             latent = torch.cat([latent, latent2], 1)
+        
         """
         if len(styles) < 2:
             start_index = self.n_latent
@@ -933,6 +1042,10 @@ class Generator(nn.Module):
             return image, latent
         elif style_mix:
             return image, None
+        elif latent_recon:
+            return re_latent
+        elif return_var:
+            return image, var_tmp
         else:
             return image, None
 
@@ -948,21 +1061,25 @@ if __name__ == "__main__":
     # print(output.shape)
 
 
-    test_encoder = Content_Encoder(input_channel=3)
+    # test_encoder = Content_Encoder(input_channel=3)
     test_generator = Generator()
 
-    content_img = torch.randn(1,3,64,256)
-    content_img = F.resize(content_img, (256,256))
+    content_img = torch.randn(8,1,64,256)
+    import torchvision
+    content_img = torchvision.transforms.functional.resize(content_img, (256,256))
+
+    style_img = torch.randn(8,3,256,256)
+
+    output= test_generator(content_img, style_img)
+
+    # content_latent = test_encoder(content_img)
 
 
-    content_latent = test_encoder(content_img)
+    # style = torch.ones(1,1,512)
 
+    # output = test_generator(content_latent, style)
 
-    style = torch.ones(1,1,512)
-
-    output = test_generator(content_latent, style)
-
-    print(output.shape)
+    # print(output.shape)
     print('done')
 
     

@@ -1,9 +1,11 @@
 import argparse
+from calendar import c
 import math
 import random
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
+import string
 import numpy as np
 import torch
 from torch import nn, autograd, optim
@@ -12,7 +14,7 @@ from torch.utils import data
 import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
-
+from torchvision.transforms import functional
 try:
     import wandb
 
@@ -29,6 +31,10 @@ from distributed import (
 )
 from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
+
+from PIL import Image
+# OCR 
+from OCR.demo import demo
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -124,6 +130,21 @@ def set_grad_none(model, targets):
         if n in targets:
             p.grad = None
 
+def ocr_pred(c_demo_image, p_t, predict_text=False):
+    # [1,1,64,256]으로 model 예측이 안됨 
+    # [10,1,64,256]으로는 되기 때문에..
+    #c_demo_image = torch.cat([c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image], dim=0)
+    if predict_text==False:
+        pred = demo(args,c_demo_image,p_t) #content image를 넣었을 때 예측되는 글자
+        return pred
+    else:
+        closs_preds, closs_target, pred = demo(args, c_demo_image, p_t, predict_text=True) #content image를 넣었을 때 예측되는 글자
+        return closs_preds, closs_target, pred
+
+def c_loss(preds1, preds2):
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
+    loss = criterion(preds1.view(-1, preds1.shape[-1]), preds2.contiguous().view(-1))
+    return loss
 
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
     loader = sample_data(loader)
@@ -161,176 +182,85 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
 
-    sample_z = torch.randn(args.n_sample, args.latent, device=device)
-    sample_c = torch.randn(args.n_sample, 16, device=device)
+    ex_img, gray_text_img, label = next(loader)
+    ex_img = ex_img.to(device)
+    gray_text_img = gray_text_img.to(device)
+    ex_img_resize = functional.resize(ex_img, (256,256))
+    utils.save_image(
+        ex_img,
+        f"ce_sample/ce_train_final/test_recon/style.png",
+        nrow=1,
+        normalize=True,
+        range=(-1, 1),
+    )
+    utils.save_image(
+        gray_text_img,
+        f"ce_sample/ce_train_final/test_recon/content.png",
+        nrow=1,
+        normalize=True,
+        range=(-1, 1),
+    )
 
     for idx in pbar:
         i = idx + args.start_iter
 
         if i > args.iter:
             print("Done!")
-
             break
 
-        real_img = next(loader)
-        real_img = real_img.to(device)
-
-        requires_grad(generator, False)
-        requires_grad(discriminator, True)
-
-        content = torch.randn(args.batch, 16, device=device)
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(content, noise)
-
-        if args.augment:
-            real_img_aug, _ = augment(real_img, ada_aug_p)
-            fake_img, _ = augment(fake_img, ada_aug_p)
-
-        else:
-            real_img_aug = real_img
-
-        # fake img,real img shape [4,3,64,256]
-        fake_pred = discriminator(fake_img)
-        real_pred = discriminator(real_img_aug)
-        d_loss = d_logistic_loss(real_pred, fake_pred)
-
-        loss_dict["d"] = d_loss
-        loss_dict["real_score"] = real_pred.mean()
-        loss_dict["fake_score"] = fake_pred.mean()
-
-        discriminator.zero_grad()
-        d_loss.backward()
-
-        if args.tensor:
-            writer.add_scalar("Loss/d_loss", d_loss, idx)
-
-        d_optim.step()
-
-        if args.augment and args.augment_p == 0:
-            ada_aug_p = ada_augment.tune(real_pred)
-            r_t_stat = ada_augment.r_t_stat
-
-        d_regularize = i % args.d_reg_every == 0
-
-        if d_regularize:
-            real_img.requires_grad = True
-
-            if args.augment:
-                real_img_aug, _ = augment(real_img, ada_aug_p)
-
-            else:
-                real_img_aug = real_img
-
-            real_pred = discriminator(real_img_aug)
-            r1_loss = d_r1_loss(real_pred, real_img)
-
-            discriminator.zero_grad()
-            (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
-
-            d_optim.step()
-
-        loss_dict["r1"] = r1_loss
-
+        real_img_resize = functional.resize(ex_img, (256,256))
+        gray_text_img = gray_text_img.to(device)
+        
+        # G train
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        content = torch.randn(args.batch, args.latent, device=device)
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-
-        fake_img, _ = generator(content, noise)
+        fake_img, _ = generator(gray_text_img, real_img_resize)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
-        fake_pred = discriminator(fake_img)
-        g_loss = g_nonsaturating_loss(fake_pred)
+        loss_dict["path"] = path_loss
+        loss_dict["path_length"] = path_lengths.mean()
 
-        loss_dict["g"] = g_loss
+        fake_img, _ = generator(gray_text_img, real_img_resize)
+        fake_img_gray = functional.rgb_to_grayscale(fake_img)
+
+        recon_l2_loss = F.mse_loss(fake_img, ex_img)
+        g_loss = args.recon_factor * recon_l2_loss
 
         generator.zero_grad()
         g_loss.backward()
-
-        if args.tensor:
-            writer.add_scalar("Loss/g_loss", g_loss, idx)
-        
         g_optim.step()
 
         g_regularize = i % args.g_reg_every == 0
 
-        if g_regularize:
-            path_batch_size = max(1, args.batch // args.path_batch_shrink)
-
-            content = torch.randn(args.batch, 16, device=device)
-            noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-
-            fake_img, latents = generator(content, noise, return_latents=True)
-
-            path_loss, mean_path_length, path_lengths = g_path_regularize(
-                fake_img, latents, mean_path_length
-            )
-
-            generator.zero_grad()
-            weighted_path_loss = args.path_regularize * args.g_reg_every * path_loss
-
-            if args.path_batch_shrink:
-                weighted_path_loss += 0 * fake_img[0, 0, 0, 0]
-
-            weighted_path_loss.backward()
-
-            g_optim.step()
-
-            mean_path_length_avg = (
-                reduce_sum(mean_path_length).item() / get_world_size()
-            )
-
-        loss_dict["path"] = path_loss
-        loss_dict["path_length"] = path_lengths.mean()
+        loss_dict["recon_loss"] = recon_l2_loss
 
         accumulate(g_ema, g_module, accum)
 
         loss_reduced = reduce_loss_dict(loss_dict)
 
-        d_loss_val = loss_reduced["d"].mean().item()
-        g_loss_val = loss_reduced["g"].mean().item()
-        r1_val = loss_reduced["r1"].mean().item()
-        path_loss_val = loss_reduced["path"].mean().item()
-        real_score_val = loss_reduced["real_score"].mean().item()
-        fake_score_val = loss_reduced["fake_score"].mean().item()
-        path_length_val = loss_reduced["path_length"].mean().item()
-
         if get_rank() == 0:
-            pbar.set_description(
-                (
-                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
-                    f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
-                    f"augment: {ada_aug_p:.4f}"
-                )
-            )
 
             if wandb and args.wandb:
                 wandb.log(
                     {
                         "Generator": g_loss_val,
-                        "Discriminator": d_loss_val,
                         "Augment": ada_aug_p,
                         "Rt": r_t_stat,
-                        "R1": r1_val,
-                        "Path Length Regularization": path_loss_val,
                         "Mean Path Length": mean_path_length,
-                        "Real Score": real_score_val,
-                        "Fake Score": fake_score_val,
-                        "Path Length": path_length_val,
                     }
                 )
 
             if i % args.save_freq == 0:
                 with torch.no_grad():
-                    g_ema.eval()
-                    sample, _ = g_ema(sample_c,[sample_z])
+                    fake_img, _ = generator(gray_text_img, real_img_resize)
+
                     utils.save_image(
-                        sample,
-                        f"sample/{str(i).zfill(6)}.png",
-                        nrow=int(args.n_sample ** 0.5),
+                        fake_img,
+                        f"ce_sample/ce_train_final/test_recon/{str(i).zfill(6)}.png",
+                        nrow=1,
                         normalize=True,
                         range=(-1, 1),
                     )
@@ -346,27 +276,28 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         "args": args,
                         "ada_aug_p": ada_aug_p,
                     },
-                    f"checkpoint/{str(i).zfill(6)}.pt",
+                    f"ce_checkpoint/ce_train_final/test_recon/{str(i).zfill(6)}.pt",
                 )
-
 
 if __name__ == "__main__":
     device = "cuda"
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("--path", type=str, default = '/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/', help="path to the lmdb dataset")
+    parser.add_argument("--img_folder", type=str, default = '/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/', help="path to the lmdb dataset")
+    parser.add_argument("--test_label_path", type=str, default = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/label_dic.json")
+    parser.add_argument("--gray_text_folder", type=str, default = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/gray_text")
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
     )
     parser.add_argument(
-        "--batch", type=int, default=16, help="batch sizes for each gpus"
+        "--batch", type=int, default=1, help="batch sizes for each gpus"
     )
     parser.add_argument(
         "--n_sample",
         type=int,
-        default=64,
+        default=8,
         help="number of the samples generated during training",
     )
     parser.add_argument(
@@ -434,6 +365,9 @@ if __name__ == "__main__":
         "--augment", action="store_true", help="apply non leaking augmentation"
     )
     parser.add_argument(
+        "--freeze", action="store_true", help="generator/discriminator freeze"
+    )
+    parser.add_argument(
         "--augment_p",
         type=float,
         default=0,
@@ -444,6 +378,12 @@ if __name__ == "__main__":
         type=float,
         default=0.6,
         help="target augmentation probability for adaptive augmentation",
+    )
+    parser.add_argument(
+        "--recon_factor",
+        type=float,
+        default=10.0,
+        help="reconstruction loss facator",
     )
     parser.add_argument(
         "--ada_length",
@@ -474,18 +414,14 @@ if __name__ == "__main__":
     args.start_iter = 0
 
     if args.arch == 'stylegan2':
-        from model import Generator, Discriminator
+        from model import Generator, Discriminator, Content_Encoder, Style_Encoder
 
     elif args.arch == 'swagan':
         from swagan import Generator, Discriminator
 
-    generator = Generator(
-    ).to(device)
-    discriminator = Discriminator(
-        channel_multiplier=args.channel_multiplier
-    ).to(device)
-    g_ema = Generator(
-    ).to(device)
+    generator = Generator().to(device)
+    discriminator = Discriminator(channel_multiplier=args.channel_multiplier).to(device)
+    g_ema = Generator().to(device)
     g_ema.eval()
     #accumulate(g_ema, generator, 0)
 
@@ -537,7 +473,7 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-    dataset = IMGUR5K_Handwriting(args.path)
+    dataset = IMGUR5K_Handwriting(args.img_folder, args.test_label_path, args.gray_text_folder, train=True)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
@@ -547,6 +483,4 @@ if __name__ == "__main__":
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
-    print(discriminator)
     train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
-

@@ -1,11 +1,8 @@
 import argparse
-from calendar import c
 import math
 import random
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
-import string
 import numpy as np
 import torch
 from torch import nn, autograd, optim
@@ -14,14 +11,20 @@ from torch.utils import data
 import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
-from torchvision.transforms import functional
+
 try:
     import wandb
 
 except ImportError:
     wandb = None
 
-from dataset import IMGUR5K_Handwriting
+# OCR 
+from OCR.demo import demo
+from OCR.utils import CTCLabelConverter, AttnLabelConverter
+from OCR.dataset import RawDataset, AlignCollate
+from OCR.model import Model
+
+from dataset import MultiResolutionDataset
 from distributed import (
     get_rank,
     synchronize,
@@ -32,12 +35,25 @@ from distributed import (
 from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
-from PIL import Image
-# OCR 
-from OCR.demo import demo
+def ocr_pred(c_demo_image):
 
-from torch.utils.tensorboard import SummaryWriter
+    # [1,1,64,256]으로 model 예측이 안됨 github에 비슷한 오류를 가진 사람이 많음. 다들 해결 못함
+    # [10,1,64,256]으로는 되기 때문에 우선 임시방편
+    c_demo_image = torch.cat([c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image], dim=0)
+    c_pred = demo(args, c_demo_image) #content image를 넣었을 때 예측되는 글자
+    return c_pred
 
+def one_hot_encoding(word, word2index):
+       one_hot_vector = [0]*(len(word2index))
+       index = word2index[word]
+       one_hot_vector[index] = 1
+       return one_hot_vector
+
+def c_loss(preds1, preds2):
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
+    loss = criterion(preds1.view(-1, preds1.shape[-1]), preds2.contiguous().view(-1))
+    print(loss)
+    return loss
 
 def data_sampler(dataset, shuffle, distributed):
     if distributed:
@@ -130,34 +146,27 @@ def set_grad_none(model, targets):
         if n in targets:
             p.grad = None
 
-def ocr_pred(c_demo_image, p_t, predict_text=False):
-    # [1,1,64,256]으로 model 예측이 안됨 
-    # [10,1,64,256]으로는 되기 때문에..
-    #c_demo_image = torch.cat([c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image], dim=0)
-    if predict_text==False:
-        pred = demo(args,c_demo_image,p_t) #content image를 넣었을 때 예측되는 글자
-        return pred
-    else:
-        closs_preds, closs_target, pred = demo(args, c_demo_image, p_t, predict_text=True) #content image를 넣었을 때 예측되는 글자
-        return closs_preds, closs_target, pred
-
-def c_loss(preds1, preds2):
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
-    loss = criterion(preds1.view(-1, preds1.shape[-1]), preds2.contiguous().view(-1))
-    return loss
 
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+    
+    #OCR
+    """ model configuration """
+    if 'CTC' in args.Prediction:
+        converter = CTCLabelConverter(args.character)
+    else:
+        converter = AttnLabelConverter(args.character)
+    args.num_class = len(converter.character)
+
+    if args.rgb:
+        args.input_channel = 3
+    ocr_module = Model(args)
+
+    # model = torch.nn.DataParallel(model).to(device)
+    ocr_module.load_state_dict(torch.load(args.saved_model, map_location=device))
+
+    ocr_module.requires_grad_(False)
+    
     loader = sample_data(loader)
-
-    imsave_path = './ce_sample/ce_train_final/'+args.dir_name
-    model_path = './ce_checkpoint/ce_train_final/'+args.dir_name
-    if not os.path.exists(imsave_path):
-        os.makedirs(imsave_path)
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
-
-    if args.tensor:
-        writer = SummaryWriter()
 
     pbar = range(args.iter)
 
@@ -189,104 +198,24 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
 
-    ex_img, gray_text_img_ex, label = next(loader)
-    ex_img = ex_img.to(device)
-    ex_img_resize = functional.resize(ex_img, (256,256))
-    utils.save_image(
-        ex_img,
-        f"ce_sample/ce_train_final/{args.dir_name}/style.png",
-        nrow=1,
-        normalize=True,
-        range=(-1, 1),
-    )
-
-    # c_image = input content image
-    image = Image.open('./gray_text/result/EARTH.png')
-    tf = transforms.ToTensor()
-    c_image = tf(image) #c_image shape = [1,64,256]
-    c_demo_image = c_image.unsqueeze(dim=0) # shape [1,3,64,256]
-    if args.content_resnet==False:
-        c_demo_image_gray = functional.rgb_to_grayscale(c_demo_image)
-    else:
-        c_demo_image_gray = c_demo_image
-    utils.save_image(
-        c_demo_image_gray,
-        f"ce_sample/ce_train_final/{args.dir_name}/content.png",
-        nrow=1,
-        normalize=True,
-        range=(-1, 1),
-                    )
-    c_demo_image_gray = c_demo_image_gray.to(device)
-    c_demo_image_gray = c_demo_image_gray.repeat(args.batch, 1, 1, 1)
-
-    sample_z = torch.randn(4, args.latent, device=device)
-
-
-    var_dic = {}
-    var_dic['random']=[]
-    var_dic['encoder']=[]
+    sample_z = torch.randn(args.n_sample, args.latent, device=device)
 
     for idx in pbar:
         i = idx + args.start_iter
 
         if i > args.iter:
             print("Done!")
+
             break
 
-        # gray_text_img shape=[batch,1,64,256]
-        # real_img shape=[batch,3,64,256]
-        real_img, gray_text_img, label = next(loader)
-
-        if args.train_store:
-            if i % 10 == 0:
-                utils.save_image(
-                    real_img,
-                    f"ce_sample/ce_train_final/{args.dir_name}/train_store_style{str(i).zfill(6)}.png",
-                    nrow=1,
-                    normalize=True,
-                    range=(-1, 1),
-                )
-                utils.save_image(
-                    gray_text_img,
-                    f"ce_sample/ce_train_final/{args.dir_name}/train_store_content{str(i).zfill(6)}.png",
-                    nrow=1,
-                    normalize=True,
-                    range=(-1, 1),
-                )
-
-
-        #variance analysis
-        if args.return_var:
-            requires_grad(generator, False)
-            requires_grad(discriminator, False)
-            real_img = real_img.to(device)
-            real_img_resize = functional.resize(real_img, (256,256))
-
-            gray_text_img = gray_text_img.to(device)   
-
-            # style encoder 나온 image
-            _, var_encoder = generator(gray_text_img, real_img_resize,return_var=True)
-
-            # random noise로 만든 image
-            noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-            _, var_random = generator(gray_text_img, noise,random_style=True,return_var=True)
-
-            var_dic['random'].append(var_encoder)
-            var_dic['encoder'].append(var_random)
-
-            continue
-
-    
+        real_img = next(loader)
         real_img = real_img.to(device)
-        real_img_resize = functional.resize(real_img, (256,256))
-
-        gray_text_img = gray_text_img.to(device)
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
-        # style encoder 나온 image
-        fake_img, _ = generator(gray_text_img, real_img_resize)
+        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        fake_img, _ = generator(noise)
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -298,29 +227,14 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         fake_pred = discriminator(fake_img)
         real_pred = discriminator(real_img_aug)
         d_loss = d_logistic_loss(real_pred, fake_pred)
-        
-        discriminator.zero_grad()
-        d_loss.backward()
-        d_optim.step()
-
-        # random noise로 만든 image
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(gray_text_img, noise,random_style=True)
-
-        fake_pred = discriminator(fake_img)
-        real_pred = discriminator(real_img_aug)
-        d_loss = d_logistic_loss(real_pred, fake_pred)
-
-        discriminator.zero_grad()
-        d_loss.backward()
-        d_optim.step()
 
         loss_dict["d"] = d_loss
         loss_dict["real_score"] = real_pred.mean()
         loss_dict["fake_score"] = fake_pred.mean()
 
-        if args.tensor:
-            writer.add_scalar("Loss/d_loss", d_loss, idx)
+        discriminator.zero_grad()
+        d_loss.backward()
+        d_optim.step()
 
         if args.augment and args.augment_p == 0:
             ada_aug_p = ada_augment.tune(real_pred)
@@ -333,6 +247,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
             if args.augment:
                 real_img_aug, _ = augment(real_img, ada_aug_p)
+
             else:
                 real_img_aug = real_img
 
@@ -345,13 +260,12 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             d_optim.step()
 
         loss_dict["r1"] = r1_loss
-        
-        # G train
-        # style encoder로 만든 image
+
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        fake_img, _ = generator(gray_text_img, real_img_resize)
+        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        fake_img, _ = generator(noise)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
@@ -359,84 +273,19 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         fake_pred = discriminator(fake_img)
         g_loss = g_nonsaturating_loss(fake_pred)
 
-        fake_img, _ = generator(gray_text_img, real_img_resize)
-        fake_img_gray = functional.rgb_to_grayscale(fake_img)
-        
-        if args.train_store:
-            if i % 10 == 0:
-                utils.save_image(
-                    fake_img,
-                    f"ce_sample/ce_train_final/{args.dir_name}/train_store_result_style{str(i).zfill(6)}.png",
-                    nrow=1,
-                    normalize=True,
-                    range=(-1, 1),
-                )
-        """
-        # OCR 특수문자 인식 X, 대문자 to 소문자, 25개 미만 글자
-        label = [l.lower() for l in label]     
-        #label = [l.translate(str.maketrans('', '', string.punctuation)) for l in label]
-        new_label = []
-        for k in label:
-            for j in k:
-                if not j in args.character:
-                    k = k.replace(j,'')
-            if len(k) > 25:
-                k = k[:25]
-            new_label.append(k)
-
-        closs_preds, closs_target , pred = ocr_pred(fake_img_gray, new_label, predict_text=True)
-
-        ocr_loss = c_loss(closs_preds, closs_target)
-        ocr_loss.requires_grad=True
-        """
-        # image recon loss(논문)
-        recon_image = F.mse_loss(fake_img, real_img)
-
-        # latent recon loss
-        orig_latent = generator(gray_text_img, real_img_resize, latent_recon=True) # real image 넣어서 style encoder latent 
-        latent_recon_img = functional.resize(fake_img, (256,256))
-        fake_latent = generator(gray_text_img, latent_recon_img, latent_recon=True) # fake image 넣어서 style encoder latent
-        recon_latent = F.mse_loss(orig_latent, fake_latent)
-
-        # diversity sensitive loss
-
-        g_loss = g_loss + args.recon_factor * recon_image 
-        #g_loss = g_loss + args.recon_factor * recon_image + ocr_loss
-        #g_loss = g_loss + ocr_loss
-
-        if args.tensor:
-            writer.add_scalar("Loss/recon_l2_loss", recon_image, idx)
-            #writer.add_scalar("Loss/ocr_loss", ocr_loss, idx)
-            writer.add_scalar("Loss/recon_latent", recon_latent, idx)
+        loss_dict["g"] = g_loss
 
         generator.zero_grad()
         g_loss.backward()
         g_optim.step()
-
-        # random noise로 만든 image
-        fake_img, _ = generator(gray_text_img, noise, random_style=True)
-
-        fake_pred = discriminator(fake_img)
-        g_loss = g_nonsaturating_loss(fake_pred)
-
-        generator.zero_grad()
-        g_loss.backward()
-        g_optim.step()
-
-        if args.tensor:
-            writer.add_scalar("Loss/g_loss", g_loss, idx)
-
-        loss_dict["path"] = path_loss
-        loss_dict["path_length"] = path_lengths.mean()
 
         g_regularize = i % args.g_reg_every == 0
 
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
+            noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
+            fake_img, latents = generator(noise, return_latents=True)
 
-            fake_img, latents = generator(gray_text_img, noise, random_style=True, return_latents=True)
-            #fake_img, latents = generator(gray_text_img, real_img_resize, return_latents=True)
-        
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
             )
@@ -448,26 +297,15 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 weighted_path_loss += 0 * fake_img[0, 0, 0, 0]
 
             weighted_path_loss.backward()
+
             g_optim.step()
 
             mean_path_length_avg = (
                 reduce_sum(mean_path_length).item() / get_world_size()
             )
 
-        if args.train_store:
-            if i % 10 == 0:
-                utils.save_image(
-                    fake_img,
-                    f"ce_sample/ce_train_final/{args.dir_name}/train_store_result{str(i).zfill(6)}.png",
-                    nrow=1,
-                    normalize=True,
-                    range=(-1, 1),
-                )
-
-        loss_dict["recon_image"] = recon_image
-        loss_dict["recon_latent"] = recon_latent
-        #loss_dict["ocr_loss"] = ocr_loss
-        loss_dict["g"] = g_loss
+        loss_dict["path"] = path_loss
+        loss_dict["path_length"] = path_lengths.mean()
 
         accumulate(g_ema, g_module, accum)
 
@@ -506,27 +344,17 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
 
-            if i % args.save_freq == 0:
+            if i % 100 == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    t_fake_img_random, _ = g_ema(c_demo_image_gray, [sample_z], random_style=True)
-                    t_fake_img, _ = g_ema(c_demo_image_gray, ex_img_resize)
-
+                    sample, _ = g_ema([sample_z])
                     utils.save_image(
-                        t_fake_img,
-                        f"ce_sample/ce_train_final/{args.dir_name}/{str(i).zfill(6)}.png",
-                        nrow=1,
+                        sample,
+                        f"sample/{str(i).zfill(6)}.png",
+                        nrow=int(args.n_sample ** 0.5),
                         normalize=True,
                         range=(-1, 1),
                     )
-                    utils.save_image(
-                        t_fake_img_random,
-                        f"ce_sample/ce_train_final/{args.dir_name}/{str(i).zfill(6)}_randomnoise.png",
-                        nrow=1,
-                        normalize=True,
-                        range=(-1, 1),
-                    )
-
 
             if i % 10000 == 0:
                 torch.save(
@@ -539,43 +367,28 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         "args": args,
                         "ada_aug_p": ada_aug_p,
                     },
-                    f"ce_checkpoint/ce_train_final/{args.dir_name}/{str(i).zfill(6)}.pt",
+                    f"checkpoint/{str(i).zfill(6)}.pt",
                 )
 
-    if args.return_var:
-        total_random_var = torch.cat(var_dic['random']).mean()
-        total_encoder_var = torch.cat(var_dic['encoder']).mean()
-        print(f"random_var : {total_random_var}, encoder_var : {total_encoder_var}")
-        print("done!")
 
 if __name__ == "__main__":
     device = "cuda"
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("--dataset_dir", type=str, default = '/mnt/f06b55a9-977c-474a-bed0-263449158d6a/textailor_CLAB/dataset/IMGUR5K-Handwriting-Dataset', help='datset directory')
-    parser.add_argument("--img_folder", type=str, default = '/mnt/f06b55a9-977c-474a-bed0-263449158d6a/textailor_CLAB/dataset/IMGUR5K-Handwriting-Dataset/preprocessed', help="path to the lmdb dataset")
-    parser.add_argument("--test_label_path", type=str, default = "/mnt/f06b55a9-977c-474a-bed0-263449158d6a/textailor_CLAB/dataset/IMGUR5K-Handwriting-Dataset/label_dic.json")
-    parser.add_argument("--gray_text_folder", type=str, default = "/mnt/f06b55a9-977c-474a-bed0-263449158d6a/textailor_CLAB/dataset/IMGUR5K-Handwriting-Dataset/gray_text")
+    parser.add_argument("path", type=str, help="path to the lmdb dataset")
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
-    parser.add_argument('--dir_name', type=str, default='hi', help='저장 이름')
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
     )
     parser.add_argument(
-        "--batch", type=int, default=4, help="batch sizes for each gpus"
+        "--batch", type=int, default=16, help="batch sizes for each gpus"
     )
     parser.add_argument(
         "--n_sample",
         type=int,
-        default=8,
+        default=64,
         help="number of the samples generated during training",
-    )
-    parser.add_argument(
-        "--save_freq",
-        type=int,
-        default=1000,
-        help="save frequency",
     )
     parser.add_argument(
         "--size", type=int, default=256, help="image sizes for the model"
@@ -627,16 +440,10 @@ if __name__ == "__main__":
         "--wandb", action="store_true", help="use weights and biases logging"
     )
     parser.add_argument(
-        "--tensor", action="store_true", help="tensorboard"
-    )
-    parser.add_argument(
         "--local_rank", type=int, default=0, help="local rank for distributed training"
     )
     parser.add_argument(
         "--augment", action="store_true", help="apply non leaking augmentation"
-    )
-    parser.add_argument(
-        "--freeze", action="store_true", help="generator/discriminator freeze"
     )
     parser.add_argument(
         "--augment_p",
@@ -651,12 +458,6 @@ if __name__ == "__main__":
         help="target augmentation probability for adaptive augmentation",
     )
     parser.add_argument(
-        "--recon_factor",
-        type=float,
-        default=10.0,
-        help="reconstruction loss facator",
-    )
-    parser.add_argument(
         "--ada_length",
         type=int,
         default=500 * 1000,
@@ -668,20 +469,13 @@ if __name__ == "__main__":
         default=256,
         help="probability update interval of the adaptive augmentation",
     )
-    parser.add_argument(
-        "--train_store", action="store_true"
-    )
-    parser.add_argument(
-        "--content_resnet", action="store_true"
-    )
-
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
     parser.add_argument('--ocr_batch_size', type=int, default=192, help='input batch size')
     parser.add_argument('--saved_model', required=True, help="path to saved_model to evaluation")
     """ Data processing """
     parser.add_argument('--batch_max_length', type=int, default=25, help='maximum-label-length')
-    parser.add_argument('--imgH', type=int, default=32, help='the height of the input image')
-    parser.add_argument('--imgW', type=int, default=100, help='the width of the input image')
+    parser.add_argument('--imgH', type=int, default=64, help='the height of the input image')
+    parser.add_argument('--imgW', type=int, default=256, help='the width of the input image')
     parser.add_argument('--rgb', action='store_true', help='use rgb input')
     parser.add_argument('--character', type=str, default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
     parser.add_argument('--sensitive', action='store_true', help='for sensitive character mode')
@@ -697,21 +491,15 @@ if __name__ == "__main__":
                         help='the number of output channel of Feature extractor')
     parser.add_argument('--hidden_size', type=int, default=256, help='the size of the LSTM hidden state')
 
-    """ Analysis """
-    parser.add_argument('--return_var', action='store_true', help='return_var')
-
     args = parser.parse_args()
 
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = n_gpu > 1
 
-    if args.distributed:     
-        print("distributed 성공")
+    if args.distributed:
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
-    
-    print('Count of using GPUs:', torch.cuda.device_count())
 
     args.latent = 512
     args.n_mlp = 8
@@ -719,14 +507,20 @@ if __name__ == "__main__":
     args.start_iter = 0
 
     if args.arch == 'stylegan2':
-        from model import Generator, Discriminator, Content_Encoder, Style_Encoder
+        from model import Generator, Discriminator
 
     elif args.arch == 'swagan':
         from swagan import Generator, Discriminator
 
-    generator = Generator().to(device)
-    discriminator = Discriminator(channel_multiplier=args.channel_multiplier).to(device)
-    g_ema = Generator().to(device)
+    generator = Generator(
+        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+    ).to(device)
+    discriminator = Discriminator(
+        args.size, channel_multiplier=args.channel_multiplier
+    ).to(device)
+    g_ema = Generator(
+        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+    ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
 
@@ -778,15 +572,15 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-    img_folder = args.dataset_dir+'/preprocessed'
-    label_path = args.dataset_dir+'/label_dic.json'
-    gray_text_folder = args.dataset_dir+'/gray_text'
+    transform = transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+        ]
+    )
 
-    # dataset = IMGUR5K_Handwriting(args.img_folder, args.test_label_path, args.gray_text_folder, train=True)
-    if args.content_resnet==True:
-        dataset = IMGUR5K_Handwriting(img_folder,label_path, gray_text_folder, train=True, content_resnet=True)
-    else:
-        dataset = IMGUR5K_Handwriting(img_folder,label_path, gray_text_folder, train=True)
+    dataset = MultiResolutionDataset(args.path, transform, args.size)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
@@ -796,4 +590,5 @@ if __name__ == "__main__":
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
+
     train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)

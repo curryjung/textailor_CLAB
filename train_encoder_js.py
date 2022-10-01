@@ -17,7 +17,7 @@ import shutil
 
 
 
-from model import Encoder, Generator, Discriminator, ImageToLatent, Encoder_js
+from model import Encoder, Generator, Discriminator, ImageToLatent, Style_Encoder
 from dataset import IMGUR5K_Handwriting
 
 from torch.utils.tensorboard import SummaryWriter
@@ -207,7 +207,7 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
 
         # real_img_dis = real_img_dis.detach()
         # real_img_dis.requires_grad = False
-        
+        print(real_img_enc.shape)
         latents = encoder(real_img_enc)
         # latents = torch.randn(args.batch, args.latent, device=device).to(device)
 
@@ -318,15 +318,17 @@ def train(args, loader, encoder, generator, discriminator, e_optim, d_optim, dev
                 f"/home/sy/textailor_CLAB/checkpoint/encoder_{args.exp_name}_{args.exp_disc}_{str(i).zfill(6)}.pt",
             )
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+
+    parser.add_argument("--train_g_with_c", action="store_true")
 
     parser.add_argument("--path", type=str, default='/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed/')
     parser.add_argument("--g_ckpt", type=str, default='/home/sy/textailor_CLAB/checkpoint/100000.pt')
     parser.add_argument("--e_ckpt", type=str, default=None)
     parser.add_argument("--exp_name", type=str, default="run_js")
     parser.add_argument("--exp_disc", type=str, default="overfit_style_encoder_only_batch_8_lr_0.005")
+
 
     parser.add_argument("--use_w", type=bool, default=True)
     parser.add_argument("--use_only_one_sample", type=bool, default= True)
@@ -394,7 +396,7 @@ if __name__ == "__main__":
     generator = Generator().to(device)
     discriminator = Discriminator(channel_multiplier=args.channel_multiplier).to(device)
     # encoder = Encoder().to(device)
-    encoder = Encoder_js().to(device)
+    encoder = Style_Encoder().to(device)
     # encoder = ImageToLatent().to(device)
 
     # e_optim = optim.Adam(
@@ -444,5 +446,5 @@ if __name__ == "__main__":
         sampler=data_sampler(dataset, shuffle=False),
         drop_last=True,
     )
-
+        #freeze G and train style encoder only
     train(args, loader, encoder, generator, discriminator, e_optim, d_optim, device)
