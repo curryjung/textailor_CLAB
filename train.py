@@ -33,7 +33,9 @@ from distributed import (
 from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
-from logger import TBLogger
+from OCR.demo import demo
+
+#from logger import TBLogger
 
 
 def data_sampler(dataset, shuffle, distributed):
@@ -127,6 +129,16 @@ def set_grad_none(model, targets):
         if n in targets:
             p.grad = None
 
+def ocr_pred(c_demo_image, p_t, predict_text=False):
+    # [1,1,64,256]으로 model 예측이 안됨 
+    # [10,1,64,256]으로는 되기 때문에..
+    #c_demo_image = torch.cat([c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image], dim=0)
+    if predict_text==False:
+        pred = demo(args,c_demo_image,p_t) #content image를 넣었을 때 예측되는 글자
+        return pred
+    else:
+        closs_preds, closs_target, pred = demo(args, c_demo_image, p_t, predict_text=True) #content image를 넣었을 때 예측되는 글자
+        return closs_preds, closs_target, pred
 
 def c_loss(preds1, preds2):
     criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
@@ -136,9 +148,14 @@ def c_loss(preds1, preds2):
 
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
     loader = sample_data(loader)
-    writer = TBLogger(args.dname_logger, args.dir_name)
-    os.makedirs(ospj(writer.log_dir, 'samples'), exist_ok=True)
-    os.makedirs(ospj(writer.log_dir, 'checkpoints'), exist_ok=True)
+    #writer = TBLogger(args.dname_logger, args.dir_name)
+    imsave_path = './sample/'+args.dir_name
+    model_path = './checkpoint/'+args.dir_name
+    if not os.path.exists(imsave_path):
+        os.makedirs(imsave_path)
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
+
 
     pbar = range(args.iter)
 
@@ -175,28 +192,41 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     ex_img_resize = functional.resize(ex_img, (256, 256))
     tvutils.save_image(
         ex_img,
-        f'{writer.log_dir}/samples/style_fixed.png',
+        f'./sample/{args.dir_name}/style_fixed.png',
         nrow=1,
         normalize=True,
         range=(-1, 1),
     )
 
     # c_image = input content image
-    image = Image.open('./gray_text/result/EARTH.png')
-    tf = transforms.ToTensor()
-    c_image = tf(image)  # c_image shape = [1,64,256]
-    c_demo_image = c_image.unsqueeze(dim=0)  # shape [1,3,64,256]
-    if not args.content_resnet:
-        c_demo_image_gray = functional.rgb_to_grayscale(c_demo_image)
-    else:
-        c_demo_image_gray = c_demo_image
+    if not args.get_fixed_gray_text_by_cv2:
+        image = Image.open('./gray_text/result/EARTH.png')
+        tf = transforms.ToTensor()
+        c_image = tf(image)  # c_image shape = [1,64,256]
+        c_demo_image = c_image.unsqueeze(dim=0)  # shape [1,3,64,256]
+        if not args.content_resnet:
+            c_demo_image_gray = functional.rgb_to_grayscale(c_demo_image)
+        else:
+            c_demo_image_gray = c_demo_image
+    else :
+        import cv2
+        image = cv2.imread('./gray_text/result/EARTH.png')
+        gray_transform =  transforms.Compose([
+                        transforms.ToTensor(),
+                        transforms.Resize((64,256)), 
+                        transforms.Normalize((0.5,), (0.5,))
+                    ])
+        c_image = gray_transform(image)  # c_image shape = [1,64,256]
+        c_demo_image_gray = c_image.unsqueeze(dim=0)  # shape [1,1,64,256]
+
+
     tvutils.save_image(
         c_demo_image_gray,
-        f'{writer.log_dir}/samples/content_fixed.png',
+        f'./sample/{args.dir_name}/content_fixed.png',
         nrow=1,
         normalize=True,
         range=(-1, 1),
-                    )
+    )
     c_demo_image_gray = c_demo_image_gray.to(device)
     c_demo_image_gray = c_demo_image_gray.repeat(args.batch, 1, 1, 1)
 
@@ -318,8 +348,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         g_loss = g_nonsaturating_loss(fake_pred)
 
         fake_refguided, _ = generator(gray_text_img, real_img_resize)
+        fake_refguided_gray = functional.rgb_to_grayscale(fake_refguided)
 
-        """
         # OCR 특수문자 인식 X, 대문자 to 소문자, 25개 미만 글자
         label = [l.lower() for l in label]
         #label = [l.translate(str.maketrans('', '', string.punctuation)) for l in label]
@@ -332,11 +362,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 k = k[:25]
             new_label.append(k)
 
-        closs_preds, closs_target , pred = ocr_pred(fake_img_gray, new_label, predict_text=True)
+        closs_preds, closs_target , pred = ocr_pred(fake_refguided_gray, new_label, predict_text=True)
 
         ocr_loss = c_loss(closs_preds, closs_target)
-        ocr_loss.requires_grad=True
-        """
+        ocr_loss.requires_grad=False
+
         # image recon loss(논문)
         recon_image = F.mse_loss(fake_refguided, real_img)
 
@@ -348,8 +378,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         # diversity sensitive loss
 
-        g_loss = g_loss + args.recon_factor * recon_image
-        # g_loss = g_loss + args.recon_factor * recon_image + ocr_loss
+        #g_loss = g_loss + args.recon_factor * recon_image
+        g_loss = g_loss + args.recon_factor * recon_image + ocr_loss
         # g_loss = g_loss + ocr_loss
 
         generator.zero_grad()
@@ -432,13 +462,6 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
 
-            if i % args.log_every == 0:
-                # writer.log_metrics({"Loss/ocr_loss": ocr_loss,
-                writer.log_metrics({"Loss/d_loss": d_loss,
-                                    "Loss/recon_l2_loss": recon_image,
-                                    "Loss/g_loss": g_loss,
-                                    "Loss/recon_latent": recon_latent}, idx)
-
             if i % args.image_every == 0:
                 with torch.no_grad():
                     g_ema.eval()
@@ -465,7 +488,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
                     images = np.concatenate([images, np.array(canvas)], axis=0)
                     images = Image.fromarray(images)
-                    images.save(f'{writer.log_dir}/samples/{str(i).zfill(6)}.png')
+                    images.save(f'./sample/{args.dir_name}/{str(i).zfill(6)}.png')
 
             if i % args.ckpt_every == 0:
                 torch.save({"g": g_module.state_dict(),
@@ -476,14 +499,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                             "args": args,
                             "ada_aug_p": ada_aug_p,
                             },
-                           f'{writer.log_dir}/checkpoints/{str(i).zfill(6)}.ckpt',
+                           f'./checkpoint/{args.dir_name}/{str(i).zfill(6)}.ckpt',
                            )
-
-    if args.return_var:
-        total_random_var = torch.cat(var_dic['random']).mean()
-        total_encoder_var = torch.cat(var_dic['encoder']).mean()
-        print(f"random_var : {total_random_var}, encoder_var : {total_encoder_var}")
-        print("done!")
 
 
 if __name__ == "__main__":
@@ -491,7 +508,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("--dataset_dir", type=str, default='/datasets/IMGUR5K-Handwriting-Dataset', help='datset directory')
+    parser.add_argument("--dataset_dir", type=str, default='/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets/IMGUR5K-Handwriting-Dataset', help='datset directory')
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
     parser.add_argument('--dname_logger', type=str, default='exp_logs', help='root directory for logger')
     parser.add_argument('--dir_name', type=str, default='hi', help='저장 이름')
@@ -530,6 +547,27 @@ if __name__ == "__main__":
     """ Analysis """
     parser.add_argument('--return_var', action='store_true', help='return_var')
 
+    """OCR"""
+    parser.add_argument('--saved_model', required=True, help="path to saved_model to evaluation")
+    """ Data processing """
+    parser.add_argument('--batch_max_length', type=int, default=25, help='maximum-label-length')
+    parser.add_argument('--imgH', type=int, default=32, help='the height of the input image')
+    parser.add_argument('--imgW', type=int, default=100, help='the width of the input image')
+    parser.add_argument('--rgb', action='store_true', help='use rgb input')
+    parser.add_argument('--character', type=str, default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
+    parser.add_argument('--sensitive', action='store_true', help='for sensitive character mode')
+    parser.add_argument('--PAD', action='store_true', help='whether to keep ratio then pad for image resize')
+    """ Model Architecture """
+    parser.add_argument('--Transformation', type=str, required=True, help='Transformation stage. None|TPS')
+    parser.add_argument('--FeatureExtraction', type=str, required=True, help='FeatureExtraction stage. VGG|RCNN|ResNet')
+    parser.add_argument('--SequenceModeling', type=str, required=True, help='SequenceModeling stage. None|BiLSTM')
+    parser.add_argument('--Prediction', type=str, required=True, help='Prediction stage. CTC|Attn')
+    parser.add_argument('--num_fiducial', type=int, default=20, help='number of fiducial points of TPS-STN')
+    parser.add_argument('--input_channel', type=int, default=1, help='the number of input channel of Feature extractor')
+    parser.add_argument('--output_channel', type=int, default=512,
+                        help='the number of output channel of Feature extractor')
+    parser.add_argument('--hidden_size', type=int, default=256, help='the size of the LSTM hidden state')
+
     args = parser.parse_args()
     args.content_resnet = True
 
@@ -537,7 +575,6 @@ if __name__ == "__main__":
     args.distributed = n_gpu > 1
 
     if args.distributed:
-        print("distributed 성공")
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
