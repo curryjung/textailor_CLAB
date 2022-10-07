@@ -66,28 +66,46 @@ class IMGUR5K_Handwriting(Dataset):
         img_name = self.img_list[index]
         img_id = img_name.split('.')[0]
         
-        img = cv2.imread(os.path.join(self.img_folder, img_name), cv2.IMREAD_COLOR)
+        style_img = cv2.imread(os.path.join(self.img_folder, img_name), cv2.IMREAD_COLOR)
 
-        img = self.transform(img)
+        style_img = self.transform(style_img)
 
-        # get gray text image
+        # get style_gray image : contains content of style image
         # gray_name = self.gray_list[index]
         if self.gray_text_folder is not None:
             gray_text_img_name = os.path.join(self.gray_text_folder, img_id+".png")
             if self.content_resnet==False:
-                gray_text_img = cv2.imread(gray_text_img_name, cv2.IMREAD_GRAYSCALE)
-                gray_text_img = self.gray_transform(gray_text_img)
+                style_gray_img = cv2.imread(gray_text_img_name, cv2.IMREAD_GRAYSCALE)
+                style_gray_img = self.gray_transform(style_gray_img)
             else:
-                gray_text_img = cv2.imread(gray_text_img_name)
-                gray_text_img = self.transform(gray_text_img)
+                style_gray_img = cv2.imread(gray_text_img_name)
+                style_gray_img = self.transform(style_gray_img)
         else:
-            gray_text_img = None
+            style_gray_img = None
+
+        # get style_label
+        style_label= self.label_dic[img_id]
+
+        # get content_gray image : 
+        random_idx = np.random.randint(0, len(self.img_list))
+        random_img_name = self.img_list[random_idx]
+        random_img_id = random_img_name.split('.')[0]
+        random_gray_text_img_name = os.path.join(self.gray_text_folder, random_img_id+".png")
+        if self.content_resnet==False:
+            content_gray_img = cv2.imread(random_gray_text_img_name, cv2.IMREAD_GRAYSCALE)
+            content_gray_img = self.gray_transform(content_gray_img)
+        else:
+            content_gray_img = cv2.imread(random_gray_text_img_name)
+            content_gray_img = self.transform(content_gray_img)
+
+        # get content_label
+        content_label= self.label_dic[random_img_id]
             
         if self.label_dic is not None:
             label = self.label_dic[img_id]
-            return img, gray_text_img, label
+            return style_img, style_gray_img, style_label, content_gray_img, content_label
         else:
-            return img, gray_text_img
+            return style_img, style_gray_img
 
         
 
