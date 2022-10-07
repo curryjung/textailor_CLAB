@@ -1,8 +1,10 @@
 #!/bin/bash
 d_name_logger="baseline_with_ocr_modified_ce_from_8000"
 dir_name="baseline_with_ocr_modified_ce_from_8000"
+dataset_dir="/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets/IMGUR5K-Handwriting-Dataset"
 
 python train_renew.py --dname_logger ${d_name_logger}\
+                        --dataset_dir ${dataset_dir}\
                                 --dir_name ${dir_name}\
                                 --Transformation TPS \
                                 --FeatureExtraction ResNet \
