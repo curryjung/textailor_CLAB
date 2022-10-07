@@ -779,7 +779,7 @@ class ContentResnet(models.ResNet):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        #x = self.maxpool(x)
 
         x = self.layer1(x)
         x = self.layer2(x)
@@ -864,6 +864,17 @@ class Intermediate_Generator(nn.Module):
         latent_w = self.mapping(latent_z.squeeze())
         return latent_w    
 #---------------------------------------------------------------
+class ConstantInput(nn.Module):
+    def __init__(self, channel, size=4):
+        super().__init__()
+
+        self.input = nn.Parameter(torch.randn(1, channel, size, size))
+
+    def forward(self, input):
+        batch = input.shape[0]
+        out = self.input.repeat(batch, 1, 1, 1)
+
+        return out
 
 class Generator(nn.Module):
     def __init__(
@@ -889,13 +900,13 @@ class Generator(nn.Module):
                     512, 512, lr_mul=lr_mlp, activation="fused_lrelu"
                 )
             )
+        self.input = ConstantInput(512)
         self.style = nn.Sequential(*layers)
         style_dim = 512
 
         self.style_encoder = StyleResnet() #style encoder
         self.content_encoder = ContentResnet() # content encoder
-        
-        self.input = ConstantInput(512)
+
         # block 1
         self.conv1 = StyledConv(
             512, 512, 3, style_dim, blur_kernel=blur_kernel
@@ -957,6 +968,7 @@ class Generator(nn.Module):
         # optimize_style_latent=False,
     ):  
         content = self.content_encoder(content)
+
         if random_style==False:
             styles = [self.style_encoder(styles)]
         else:
@@ -1022,9 +1034,8 @@ class Generator(nn.Module):
             out = self.input(content)
         else: #content encoder 사용
         """
-        out = self.input(content) 
         # block1
-        out = self.conv1(out, latent[:, 0])
+        out = self.conv1(content, latent[:, 0])
         skip = self.to_rgb1(out, latent[:, 1])
 
         i = 1
@@ -1064,11 +1075,11 @@ if __name__ == "__main__":
     # test_encoder = Content_Encoder(input_channel=3)
     test_generator = Generator()
 
-    content_img = torch.randn(8,1,64,256)
+    style_img = torch.randn(8,3,64,256)
     import torchvision
-    content_img = torchvision.transforms.functional.resize(content_img, (256,256))
+    content_img = torchvision.transforms.functional.resize(style_img, (256,256))
 
-    style_img = torch.randn(8,3,256,256)
+    content_img = torch.randn(8,3,64,256)
 
     output= test_generator(content_img, style_img)
 

@@ -13,6 +13,8 @@ from tqdm import tqdm
 from PIL import Image
 from PIL import ImageDraw
 
+from OCR.demo import demo
+
 class IMGUR5K_Handwriting(Dataset):
     def __init__(self, img_folder, label_path=None, gray_text_folder=None,train=True, content_resnet=False, transform=None):
         assert os.path.exists(img_folder), "img_folder does not exist"
@@ -129,14 +131,16 @@ def draw_text_on_image():
     if not os.path.exists(dst_dir):
         os.makedirs(dst_dir)
 
-    img_folder = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/preprocessed"
-    test_label_path = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/label_dic.json"
-    gray_text_folder = "/hdd/datasets/IMGUR5K-Handwriting-Dataset/gray_text"
+    base_dir = "/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets"
+    img_folder = base_dir + "/IMGUR5K-Handwriting-Dataset/preprocessed"
+    test_label_path = base_dir + "/IMGUR5K-Handwriting-Dataset/label_dic.json"
+    gray_text_folder = base_dir + "/IMGUR5K-Handwriting-Dataset/gray_text"
 
     batch_size=1
     dataset = IMGUR5K_Handwriting(img_folder, test_label_path, gray_text_folder,train=True)
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    import pdb;pdb.set_trace()
     pbar = tqdm(dataloader)
     for i, (imgs, gray_imgs, labels) in enumerate(pbar):
         if i == 500:
@@ -153,6 +157,63 @@ def draw_text_on_image():
         pil_img.save("run_js/dataset_test/{}.png".format(i))
 
 
+
+def pair_check_visual():
+
+    dst_dir = "run_js/dataset_test"
+    if not os.path.exists(dst_dir):
+        os.makedirs(dst_dir)
+
+    base_dir = "/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets"
+    img_folder = base_dir + "/IMGUR5K-Handwriting-Dataset/preprocessed"
+    test_label_path = base_dir + "/IMGUR5K-Handwriting-Dataset/label_dic.json"
+    gray_text_folder = base_dir + "/IMGUR5K-Handwriting-Dataset/gray_text"
+
+    batch_size=1
+    dataset = IMGUR5K_Handwriting(img_folder, test_label_path, gray_text_folder,train=True)
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    
+    pbar = tqdm(dataloader)
+    
+    import torch
+    import torchvision.utils as tvutils
+    from PIL import Image, ImageFont, ImageDraw
+
+    for i, (real_img, gray_text_img, label) in enumerate(pbar):
+        if i == 500:
+            break
+
+
+
+        width_cell = real_img.shape[3]
+        images = [real_img, gray_text_img]
+        images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
+        images = torch.cat(images, axis=2) * 255
+        images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
+        H, W, C = images.shape
+
+        canvas_height = 30
+        canvas = np.ones((canvas_height, W, C), images.dtype) * 255
+        font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+        canvas = Image.fromarray(canvas)
+        draw = ImageDraw.Draw(canvas)
+        padding = 5
+        centering = 50
+        words = f'real,label_{label}'.split(',')
+        for iw, word in enumerate(words):
+            offset = iw * (width_cell + padding) + centering
+            draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+        images = np.concatenate([images, np.array(canvas)], axis=0)
+        images = Image.fromarray(images)
+        images.save(os.path.join(dst_dir,f'{str(i).zfill(6)}.png'))     
+
+
+
+        pbar.set_description(f'{label}')
+
+
+
     
 
 if __name__=="__main__":
@@ -167,7 +228,9 @@ if __name__=="__main__":
     # pbar = tqdm(dataloader)
     # for i, (imgs, gray_imgs, labels) in enumerate(pbar):
     #     pbar.set_description(desc=f"imgs.shape: {imgs.shape}, gray_imgs.shape: {gray_imgs.shape}, len(labels): {len(labels)}")
-    draw_text_on_image()
+    # draw_text_on_image()
+    pair_check_visual()
+
 
         
 

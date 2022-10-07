@@ -28,13 +28,14 @@ def generate(args, loader, generator, g_ema, device, mean_latent):
     test_path = './test/'+ args.dir_name
     if not os.path.exists(test_path):
         os.makedirs(test_path)
-
+    
+    res_size = int(args.batch_size/2)
     loader = sample_data(loader)
     style_img, content_img, label = next(loader)
 
-    style_img = style_img[8:].to(device)
-    content_match = content_img[:8].to(device)
-    content_mismatch = content_img[8:].to(device)
+    style_img = style_img[res_size:].to(device)
+    content_match = content_img[:res_size].to(device)
+    content_mismatch = content_img[res_size:].to(device)
     style_img_resize = functional.resize(style_img, (256, 256))
 
     utils.save_image(
@@ -131,6 +132,7 @@ if __name__ == "__main__":
     )
     parser.add_argument('--dir_name', type=str, default='hi', help='저장 이름')
     parser.add_argument("--dataset_dir", type=str, default='/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets/IMGUR5K-Handwriting-Dataset', help='datset directory')
+    parser.add_argument("--batch_size", type=int, default=16, help="output image size of the generator")
 
     args = parser.parse_args()
 
@@ -158,7 +160,7 @@ if __name__ == "__main__":
     dataset = IMGUR5K_Handwriting(img_folder, label_path, gray_text_folder, train=True, content_resnet=True)
     loader = data.DataLoader(
         dataset,
-        batch_size=16,
+        batch_size=args.batch_size,
         sampler=data_sampler(dataset, shuffle=False),
         drop_last=True,
     )
