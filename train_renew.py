@@ -23,6 +23,7 @@ except ImportError:
     wandb = None
 
 from dataset import IMGUR5K_Handwriting
+from dataset_easy import tet_ganA, tet_ganB
 from distributed import (
     get_rank,
     synchronize,
@@ -161,8 +162,9 @@ def preprocess_label(args,label):
     return new_label
 
 
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, loader_extra = None):
     loader = sample_data(loader)
+    loader_extra = sample_data(loader_extra)
     imsave_path = './sample/'+args.dir_name
     model_path = './checkpoint/'+args.dir_name   
 
@@ -259,7 +261,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             print(f'estimated iteration({args.iter}) is finished')
             break
         
-        style_img, style_gray_img, style_label, content_gray_img, content_label = next(loader)
+        if i % 2==0:
+            style_img, style_gray_img, style_label, content_gray_img, content_label = next(loader)
+        else:
+            style_img, style_gray_img, style_label, content_gray_img, content_label = next(loader_extra)
+        
 
         if args.return_dataset_pair:
             width_cell = style_img.shape[3]
@@ -399,7 +405,13 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         else :
             ocr_loss_style = torch.tensor(0.0, device=device)
 
-        g_loss = args.recon_factor * recon_loss + args.ocr_loss_weight * (ocr_loss_content + ocr_loss_style)
+        if args.late_ocr_adaptation_n > i:
+            late_ocr_adaptation_weight = 0.0
+        else:
+            late_ocr_adaptation_weight = 1.0
+
+
+        g_loss = args.recon_factor * recon_loss + late_ocr_adaptation_weight * args.ocr_loss_weight * (ocr_loss_content + ocr_loss_style)
 
 
         loss_dict["g_recon4"] = recon_loss.item()
@@ -582,6 +594,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
+    parser.add_argument('--late_ocr_adaptation_n', type=int, default=0)
+    parser.add_argument('--dataset', type=str, default=None, help='tet_gen or image_gru5k')
     parser.add_argument("--dataset_dir", type=str, default='/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets/IMGUR5K-Handwriting-Dataset', help='datset directory')
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
     parser.add_argument('--dname_logger', type=str, default='exp_logs', help='root directory for logger')
@@ -722,12 +736,21 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-    img_folder = args.dataset_dir+'/preprocessed'
-    label_path = args.dataset_dir+'/label_dic.json'
-    gray_text_folder = args.dataset_dir+'/gray_text'
+    if args.dataset == "tet_gen":
+        img_folder = args.dataset_dir + "/imagesA"
+        test_label_path = args.dataset_dir + "/gt.txt"
+        gray_text_folder = args.dataset_dir + "/gray_textA"        
+    else:
+        img_folder = args.dataset_dir+'/preprocessed'
+        label_path = args.dataset_dir+'/label_dic.json'
+        gray_text_folder = args.dataset_dir+'/gray_text'
+
 
     # dataset = IMGUR5K_Handwriting(args.img_folder, args.test_label_path, args.gray_text_folder, train=True)
-    if args.content_resnet:
+    if args.dataset == "tet_gen":
+        dataset = tet_ganA(img_folder, test_label_path, gray_text_folder, train=True,content_resnet=True)    
+        dataset_extra = tet_ganB(img_folder, test_label_path, gray_text_folder, train=True,content_resnet=True)
+    elif args.content_resnet:
         dataset = IMGUR5K_Handwriting(img_folder, label_path, gray_text_folder, train=True, content_resnet=True)
     else:
         dataset = IMGUR5K_Handwriting(img_folder, label_path, gray_text_folder, train=True)
@@ -737,7 +760,13 @@ if __name__ == "__main__":
         sampler=data_sampler(dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
     )
+    loader_extra = data.DataLoader(
+        dataset_extra,
+        batch_size=args.batch,
+        sampler=data_sampler(dataset_extra, shuffle=True, distributed=args.distributed),
+        drop_last=True,
+    )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project=args.dir_name)
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
+    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, loader_extra = loader_extra)

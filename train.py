@@ -7,7 +7,7 @@ from PIL import Image, ImageFont, ImageDraw
 
 from os.path import join as ospj
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-
+from dataset_easy import tet_ganA, tet_ganB
 import torch
 from torch import nn, autograd, optim
 from torch.nn import functional as F
@@ -34,6 +34,7 @@ from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
 from OCR.demo import demo
+from torch.utils.tensorboard import SummaryWriter
 
 #from logger import TBLogger
 
@@ -129,7 +130,7 @@ def set_grad_none(model, targets):
         if n in targets:
             p.grad = None
 
-def ocr_pred(c_demo_image, p_t, predict_text=False):
+def ocr_pred(args, c_demo_image, p_t, predict_text=False):
     # [1,1,64,256]으로 model 예측이 안됨 
     # [10,1,64,256]으로는 되기 때문에..
     #c_demo_image = torch.cat([c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image, c_demo_image], dim=0)
@@ -156,6 +157,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     if not os.path.exists(model_path):
         os.makedirs(model_path)
 
+    if args.tensor:
+        writer = SummaryWriter()
 
     pbar = range(args.iter)
 
@@ -239,6 +242,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     for idx in pbar:
         i = idx + args.start_iter
 
+        generator.train()
+
         if i > args.iter:
             print("Done!")
             break
@@ -246,6 +251,92 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         # gray_text_img shape=[batch,1,64,256]
         # real_img shape=[batch,3,64,256]
         real_img, gray_text_img, label = next(loader)
+
+        if args.return_dataset_pair:            
+            real_img = real_img.to(device)
+            real_img_resize = functional.resize(real_img, (256, 256))
+            real_img_gray = functional.rgb_to_grayscale(real_img_resize)
+
+            gray_text_img = gray_text_img.to(device)
+
+            lower_label = [l.lower() for l in label]
+            #label = [l.translate(str.maketrans('', '', string.punctuation)) for l in label]
+            new_label = []
+            for k in lower_label:
+                for j in k:
+                    if not j in args.character:
+                        k = k.replace(j,'')
+                if len(k) > 25:
+                    k = k[:25]
+                new_label.append(k)
+
+            _,_,pred = ocr_pred(args, real_img_gray, new_label, predict_text=True)
+
+        
+
+            width_cell = real_img.shape[3]
+            height_cell = real_img.shape[2]
+            images = [real_img, gray_text_img]
+            images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
+            images = torch.cat(images, axis=2) * 255
+            images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
+            H, W, C = images.shape
+            images_dtype = images.dtype
+
+
+            # images = Image.fromarray(images)
+
+            # H,W ,C = images.shape
+            canvas_width = 256
+            canvas = np.ones((H,canvas_width,C), images_dtype) * 255
+            font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+            canvas = Image.fromarray(canvas)
+            draw = ImageDraw.Draw(canvas)
+            padding = 1
+            centering = 5
+            for ih, word in enumerate(new_label):
+                offset = ih * (height_cell + padding) + centering
+                draw.text((0, offset), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+
+            images = np.concatenate([images, np.array(canvas)], axis=1)
+
+            H,W ,C = images.shape
+            canvas_width = 256
+            canvas = np.ones((H,canvas_width,C), images_dtype) * 255
+            font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+            canvas = Image.fromarray(canvas)
+            draw = ImageDraw.Draw(canvas)
+            padding = 1
+            centering = 5
+            for ih, word in enumerate(pred):
+                offset = ih * (height_cell + padding) + centering
+                draw.text((0, offset), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+
+            images = np.concatenate([images, np.array(canvas)], axis=1)
+
+            H,W ,C = images.shape
+
+            canvas_height = 30
+            canvas = np.ones((canvas_height, W, C), images_dtype) * 255
+            font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+            canvas = Image.fromarray(canvas)
+            draw = ImageDraw.Draw(canvas) 
+            padding = 5
+            centering = 50
+            words = f'real,label,lower_label, pred_from_real'.split(',')
+            for iw, word in enumerate(words):
+                offset = iw * (width_cell + padding) + centering
+                draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+            images = np.concatenate([images, np.array(canvas)], axis=0)
+
+
+            images = Image.fromarray(images)
+
+
+            images.save(f'./sample/{args.dir_name}/{str(i).zfill(6)}.png') 
+            
+
+            continue
 
         # variance analysis
         if args.return_var:
@@ -306,6 +397,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         d_loss.backward()
         d_optim.step()
 
+        if args.tensor:
+            writer.add_scalar("Loss/d_loss", d_loss, idx)
+
         loss_dict["d"] = d_loss
         loss_dict["real_score"] = real_pred.mean()
         loss_dict["fake_score"] = fake_pred.mean()
@@ -362,13 +456,39 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 k = k[:25]
             new_label.append(k)
 
-        closs_preds, closs_target , pred = ocr_pred(fake_refguided_gray, new_label, predict_text=True)
+        closs_preds, closs_target, pred = ocr_pred(args, fake_refguided_gray, new_label, predict_text=True)
+        # import pdb;pdb.set_trace()
+
+        # if args.return_ocr_results:
+
+
+        #     # width_cell = real_img.shape[3]
+        #     # images = [real_img, gray_text_img, fake_refguided, fake_img_latentguided, t_fake_img_fixedz, t_fake_img_fixedref, t_fake_img_fixedz_g, t_fake_img_fixedref_g]
+        #     # images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
+        #     # images = torch.cat(images, axis=2) * 255
+        #     # images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
+        #     # H, W, C = images.shape
+
+        #     # canvas_height = 30
+        #     # canvas = np.ones((canvas_height, W, C), images.dtype) * 255
+        #     # font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+        #     # canvas = Image.fromarray(canvas)
+        #     # draw = ImageDraw.Draw(canvas)
+        #     # padding = 5
+        #     # centering = 50
+        #     # words = 'real,content,train_refguided,train_latentguided,fixedz_gema,fixedref_gema,fixedz_g,gixedref_g'.split(',')
+        #     # for iw, word in enumerate(words):
+        #     #     offset = iw * (width_cell + padding) + centering
+        #     #     draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+        #     # images = np.concatenate([images, np.array(canvas)], axis=0)
+        #     # images = Image.fromarray(images)
+        #     # images.save(f'./sample/{args.dir_name}/{str(i).zfill(6)}.png') 
 
         ocr_loss = c_loss(closs_preds, closs_target)
         ocr_loss.requires_grad=False
 
         # image recon loss(논문)
-        recon_image = F.mse_loss(fake_refguided, real_img)
+        recon_loss = F.mse_loss(fake_refguided, real_img)
 
         # latent recon loss
         orig_latent = generator(gray_text_img, real_img_resize, latent_recon=True)  # real image 넣어서 style encoder latent
@@ -377,10 +497,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         recon_latent = F.mse_loss(orig_latent, fake_latent)
 
         # diversity sensitive loss
-
-        #g_loss = g_loss + args.recon_factor * recon_image
-        g_loss = g_loss + args.recon_factor * recon_image + ocr_loss
-        # g_loss = g_loss + ocr_loss
+        g_loss = g_loss + args.recon_factor * recon_loss
 
         generator.zero_grad()
         g_loss.backward()
@@ -395,6 +512,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         generator.zero_grad()
         g_loss.backward()
         g_optim.step()
+
+        if args.tensor:
+            writer.add_scalar("Loss/g_loss", g_loss, idx)
 
         loss_dict["path"] = path_loss
         loss_dict["path_length"] = path_lengths.mean()
@@ -422,9 +542,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 reduce_sum(mean_path_length).item() / get_world_size()
             )
 
-        loss_dict["recon_image"] = recon_image
+        loss_dict["recon_image"] = recon_loss
         loss_dict["recon_latent"] = recon_latent
-        # loss_dict["ocr_loss"] = ocr_loss
+        loss_dict["ocr_loss"] = ocr_loss
         loss_dict["g"] = g_loss
 
         accumulate(g_ema, g_module, accum)
@@ -465,12 +585,19 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             if i % args.image_every == 0:
                 with torch.no_grad():
                     g_ema.eval()
+
                     t_fake_img_fixedz, _ = g_ema(c_demo_image_gray, [fixed_z], random_style=True)
                     t_fake_img_fixedref, _ = g_ema(c_demo_image_gray, ex_img_resize)
 
+                    generator.eval()
+
+                    t_fake_img_fixedz_g, _ = generator(c_demo_image_gray, [fixed_z], random_style=True)
+                    t_fake_img_fixedref_g, _ = generator(c_demo_image_gray, ex_img_resize)
+
+
                     width_cell = real_img.shape[3]
-                    images = [real_img, gray_text_img, fake_refguided, fake_img_latentguided, t_fake_img_fixedz, t_fake_img_fixedref]
-                    images = [tvutils.make_grid(image, nrow=1, normalize=True, value_range=(-1, 1)) for image in images]
+                    images = [real_img, gray_text_img, fake_refguided, fake_img_latentguided, t_fake_img_fixedz, t_fake_img_fixedref, t_fake_img_fixedz_g, t_fake_img_fixedref_g]
+                    images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
                     images = torch.cat(images, axis=2) * 255
                     images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
                     H, W, C = images.shape
@@ -482,7 +609,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     draw = ImageDraw.Draw(canvas)
                     padding = 5
                     centering = 50
-                    words = 'real,content,train_refguided,train_latentguided,fixedz,fixedref'.split(',')
+                    words = 'real,content,train_refguided,train_latentguided,fixedz_gema,fixedref_gema,fixedz_g,gixedref_g'.split(',')
                     for iw, word in enumerate(words):
                         offset = iw * (width_cell + padding) + centering
                         draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
@@ -508,6 +635,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
+    parser.add_argument('--dataset', type=str, default=None, help='tet_gen or image_gru5k')
     parser.add_argument("--dataset_dir", type=str, default='/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets/IMGUR5K-Handwriting-Dataset', help='datset directory')
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
     parser.add_argument('--dname_logger', type=str, default='exp_logs', help='root directory for logger')
@@ -541,11 +669,15 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_every", type=int, default=10000, help="save checkpoints every",)
     parser.add_argument("--train_store", action="store_true")
 
+    parser.add_argument("--get_fixed_gray_text_by_cv2", action="store_true")
+    parser.add_argument("--return_dataset_pair", action="store_true")
+
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
     parser.add_argument('--ocr_batch_size', type=int, default=192, help='input batch size')
 
     """ Analysis """
     parser.add_argument('--return_var', action='store_true', help='return_var')
+    parser.add_argument('--tensor', action='store_true', help='tensorboard')
 
     """OCR"""
     parser.add_argument('--saved_model', required=True, help="path to saved_model to evaluation")
@@ -641,13 +773,20 @@ if __name__ == "__main__":
             output_device=args.local_rank,
             broadcast_buffers=False,
         )
-
-    img_folder = args.dataset_dir+'/preprocessed'
-    label_path = args.dataset_dir+'/label_dic.json'
-    gray_text_folder = args.dataset_dir+'/gray_text'
+        
+    if args.dataset == "tet_gen":
+        img_folder = args.dataset_dir + "/imagesA"
+        test_label_path = args.dataset_dir + "/gt.txt"
+        gray_text_folder = args.dataset_dir + "/gray_textA"        
+    else:
+        img_folder = args.dataset_dir+'/preprocessed'
+        label_path = args.dataset_dir+'/label_dic.json'
+        gray_text_folder = args.dataset_dir+'/gray_text'
 
     # dataset = IMGUR5K_Handwriting(args.img_folder, args.test_label_path, args.gray_text_folder, train=True)
-    if args.content_resnet:
+    if args.dataset == "tet_gen":
+        dataset = tet_ganA(img_folder, test_label_path, gray_text_folder, train=True)
+    elif args.content_resnet:
         dataset = IMGUR5K_Handwriting(img_folder, label_path, gray_text_folder, train=True, content_resnet=True)
     else:
         dataset = IMGUR5K_Handwriting(img_folder, label_path, gray_text_folder, train=True)
