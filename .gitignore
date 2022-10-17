@@ -1,5 +1,7 @@
 *.pt
-
+*.pth
+*.png
+*.jpg
 __pycache__
 op
 checkpoint/
@@ -7,5 +9,11 @@ datasets/
 sample/
 run_js/
 runs/
+OCR/network/
 results/
-
+style_reshape/
+test/
+lpips/
+fake_image/
+wandb/
+dataset_check/

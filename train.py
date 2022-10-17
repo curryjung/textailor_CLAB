@@ -257,6 +257,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         generator.train()
 
+        # print(generator.style_encoder.layer1[0].conv1.weight[0,0])
+
         if i > args.iter:
             print(f'estimated iteration({args.iter}) is finished')
             break

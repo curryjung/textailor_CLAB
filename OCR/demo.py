@@ -40,6 +40,7 @@ def demo(args, img_tensor, p_t, predict_text = False):
     length_for_pred = torch.IntTensor([args.batch_max_length] * ocr_batch_size).to(device)
     text_for_pred = torch.LongTensor(ocr_batch_size, args.batch_max_length + 1).fill_(0).to(device)
 
+
     if 'CTC' in args.Prediction:
         preds = model(image, text_for_pred)
 

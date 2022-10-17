@@ -3,7 +3,6 @@ d_name_logger="easy_dataset_ocr_modified"
 dir_name="easy_dataset_ocr_modified"
 # dataset_dir="/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets/IMGUR5K-Handwriting-Dataset"
 dataset_dir="/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets/tet_gan_20k"
-ocr_pretrained_model="./OCR/network/TPS-ResNet-BiLSTM-Attn.pth"
 
 CUDA_VISIBLE_DEVICES=0 python train.py --dname_logger ${d_name_logger}\
                         --dataset_dir ${dataset_dir}\
@@ -22,7 +21,11 @@ CUDA_VISIBLE_DEVICES=0 python train.py --dname_logger ${d_name_logger}\
                                 --ckpt_every 2000\
                                 --dataset 'tet_gen'\
                                 --late_ocr_adaptation_n 0\
-
+                                --d_adv_loss_weight 0.0\
+                                --d_loss_weight 0.0\
+                                --r1 0.0\
+                                --recon_factor 0.0\
+                                --g_adv_weight 0.0\
 
                                 # --get_fixed_gray_text_by_cv2\
                                 
