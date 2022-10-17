@@ -1,5 +1,8 @@
 # CLAB/VILBA R&D (Code base: StyleGAN 2 in PyTorch)
 
+## 2022/10/17
+- script_easy.sh
+fig.4 ![w_optimize](doc/clab_textailor.png)
 
 
 ## 2022/08/30
