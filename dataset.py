@@ -16,13 +16,15 @@ from PIL import ImageDraw
 from OCR.demo import demo
 
 class IMGUR5K_Handwriting(Dataset):
-    def __init__(self, img_folder, label_path=None, gray_text_folder=None,train=True, content_resnet=False, transform=None):
+    def __init__(self, img_folder, label_path=None, gray_text_folder=None,train=True, content_resnet=False, transform=None, generate=False, fake_img_folder=None):
         assert os.path.exists(img_folder), "img_folder does not exist"
         
         self.img_folder = img_folder
         self.label_path = label_path
         self.gray_text_folder = gray_text_folder
         self.img_list = os.listdir(img_folder)
+        self.generate = generate
+        self.fake_img_folder = fake_img_folder
         if gray_text_folder is not None:
            self.gray_list = os.listdir(gray_text_folder)
         if label_path is not None:
@@ -67,8 +69,11 @@ class IMGUR5K_Handwriting(Dataset):
         img_id = img_name.split('.')[0]
         
         style_img = cv2.imread(os.path.join(self.img_folder, img_name), cv2.IMREAD_COLOR)
-
         style_img = self.transform(style_img)
+
+        if self.fake_img_folder is not None:
+            fake_img = cv2.imread(os.path.join(self.fake_img_folder, img_name), cv2.IMREAD_GRAYSCALE)
+            fake_img = self.gray_transform(fake_img)
 
         # get style_gray image : contains content of style image
         # gray_name = self.gray_list[index]
@@ -100,10 +105,15 @@ class IMGUR5K_Handwriting(Dataset):
 
         # get content_label
         content_label= self.label_dic[random_img_id]
-            
+
         if self.label_dic is not None:
-            label = self.label_dic[img_id]
-            return style_img, style_gray_img, style_label, content_gray_img, content_label
+            if self.generate==True:
+                return style_img, style_gray_img, style_label, content_gray_img, content_label, img_id
+            elif self.fake_img_folder is not None:
+                return style_img, style_gray_img, style_label, content_gray_img, content_label, fake_img
+            else:
+                label = self.label_dic[img_id]
+                return style_img, style_gray_img, style_label, content_gray_img, content_label
         else:
             return style_img, style_gray_img
 

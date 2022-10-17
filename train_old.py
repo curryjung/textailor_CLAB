@@ -7,7 +7,7 @@ from PIL import Image, ImageFont, ImageDraw
 
 from os.path import join as ospj
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-
+from dataset_easy import tet_ganA, tet_ganB
 import torch
 from torch import nn, autograd, optim
 from torch.nn import functional as F
@@ -23,7 +23,6 @@ except ImportError:
     wandb = None
 
 from dataset import IMGUR5K_Handwriting
-from dataset_easy import tet_ganA, tet_ganB
 from distributed import (
     get_rank,
     synchronize,
@@ -35,6 +34,7 @@ from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
 
 from OCR.demo import demo
+from torch.utils.tensorboard import SummaryWriter
 
 #from logger import TBLogger
 
@@ -146,32 +146,19 @@ def c_loss(preds1, preds2):
     loss = criterion(preds1.view(-1, preds1.shape[-1]), preds2.contiguous().view(-1))
     return loss
 
-def preprocess_label(args,label):
 
-    # OCR 특수문자 인식 X, 대문자 to 소문자, 25개 미만 글자
-    label = [l.lower() for l in label]
-    #label = [l.translate(str.maketrans('', '', string.punctuation)) for l in label]
-    new_label = []
-    for k in label:
-        for j in k:
-            if not j in args.character:
-                k = k.replace(j,'')
-        if len(k) > 25:
-            k = k[:25]
-        new_label.append(k)
-    return new_label
-
-
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, loader_extra = None):
+def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
     loader = sample_data(loader)
-    loader_extra = sample_data(loader_extra)
+    #writer = TBLogger(args.dname_logger, args.dir_name)
     imsave_path = './sample/'+args.dir_name
-    model_path = './checkpoint/'+args.dir_name   
-
+    model_path = './checkpoint/'+args.dir_name
     if not os.path.exists(imsave_path):
         os.makedirs(imsave_path)
     if not os.path.exists(model_path):
         os.makedirs(model_path)
+
+    if args.tensor:
+        writer = SummaryWriter()
 
     pbar = range(args.iter)
 
@@ -179,7 +166,6 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         pbar = tqdm(pbar, initial=args.start_iter, dynamic_ncols=True, smoothing=0.01)
 
     mean_path_length = 0
-
 
     d_loss_val = 0
     r1_loss = torch.tensor(0.0, device=device)
@@ -189,15 +175,26 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     mean_path_length_avg = 0
     loss_dict = {}
 
-    # fixed z and content and style
-    ex_style, ex_style_gray, _, ex_content_gray,_= next(loader)
-    ex_style = ex_style.to(device)
-    ex_style_gray = ex_style_gray.to(device)
-    ex_content_gray = ex_content_gray.to(device)
-    ex_style_resize = functional.resize(ex_style,(256,256))
+    if args.distributed:
+        g_module = generator.module
+        d_module = discriminator.module
 
+    else:
+        g_module = generator
+        d_module = discriminator
+
+    accum = 0.5 ** (32 / (10 * 1000))
+    ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
+    r_t_stat = 0
+
+    if args.augment and args.augment_p == 0:
+        ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
+
+    ex_img, gray_text_img_ex, label = next(loader)
+    ex_img = ex_img.to(device)
+    ex_img_resize = functional.resize(ex_img, (256, 256))
     tvutils.save_image(
-        ex_style,
+        ex_img,
         f'./sample/{args.dir_name}/style_fixed.png',
         nrow=1,
         normalize=True,
@@ -225,6 +222,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         c_image = gray_transform(image)  # c_image shape = [1,64,256]
         c_demo_image_gray = c_image.unsqueeze(dim=0)  # shape [1,1,64,256]
 
+
     tvutils.save_image(
         c_demo_image_gray,
         f'./sample/{args.dir_name}/content_fixed.png',
@@ -235,22 +233,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     c_demo_image_gray = c_demo_image_gray.to(device)
     c_demo_image_gray = c_demo_image_gray.repeat(args.batch, 1, 1, 1)
 
-    fixed_z = torch.randn(args.batch, args.latent, device=device)
+    fixed_z = torch.randn(4, args.latent, device=device)
 
-    if args.distributed:
-        g_module = generator.module
-        d_module = discriminator.module
-    else:
-        g_module = generator
-        d_module = discriminator    
-
-    accum = 0.5 ** (32 / (10 * 1000))
-    ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
-    r_t_stat = 0
-
-    if args.augment and args.augment_p == 0:
-        ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
-
+    var_dic = {}
+    var_dic['random'] = []
+    var_dic['encoder'] = []
 
     for idx in pbar:
         i = idx + args.start_iter
@@ -258,24 +245,74 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         generator.train()
 
         if i > args.iter:
-            print(f'estimated iteration({args.iter}) is finished')
+            print("Done!")
             break
-        
-        if i % 2==0:
-            style_img, style_gray_img, style_label, content_gray_img, content_label = next(loader)
-        else:
-            style_img, style_gray_img, style_label, content_gray_img, content_label = next(loader_extra)
+
+        # gray_text_img shape=[batch,1,64,256]
+        # real_img shape=[batch,3,64,256]
+        real_img, gray_text_img, label = next(loader)
+
+        if args.return_dataset_pair:            
+            real_img = real_img.to(device)
+            real_img_resize = functional.resize(real_img, (256, 256))
+            real_img_gray = functional.rgb_to_grayscale(real_img_resize)
+
+            gray_text_img = gray_text_img.to(device)
+
+            lower_label = [l.lower() for l in label]
+            #label = [l.translate(str.maketrans('', '', string.punctuation)) for l in label]
+            new_label = []
+            for k in lower_label:
+                for j in k:
+                    if not j in args.character:
+                        k = k.replace(j,'')
+                if len(k) > 25:
+                    k = k[:25]
+                new_label.append(k)
+
+            _,_,pred = ocr_pred(args, real_img_gray, new_label, predict_text=True)
+
         
 
-        if args.return_dataset_pair:
-            width_cell = style_img.shape[3]
-            height_cell = style_img.shape[2]
-            images = [style_img, style_gray_img, content_gray_img]
+            width_cell = real_img.shape[3]
+            height_cell = real_img.shape[2]
+            images = [real_img, gray_text_img]
             images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
             images = torch.cat(images, axis=2) * 255
             images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
             H, W, C = images.shape
             images_dtype = images.dtype
+
+
+            # images = Image.fromarray(images)
+
+            # H,W ,C = images.shape
+            canvas_width = 256
+            canvas = np.ones((H,canvas_width,C), images_dtype) * 255
+            font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+            canvas = Image.fromarray(canvas)
+            draw = ImageDraw.Draw(canvas)
+            padding = 1
+            centering = 5
+            for ih, word in enumerate(new_label):
+                offset = ih * (height_cell + padding) + centering
+                draw.text((0, offset), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+
+            images = np.concatenate([images, np.array(canvas)], axis=1)
+
+            H,W ,C = images.shape
+            canvas_width = 256
+            canvas = np.ones((H,canvas_width,C), images_dtype) * 255
+            font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+            canvas = Image.fromarray(canvas)
+            draw = ImageDraw.Draw(canvas)
+            padding = 1
+            centering = 5
+            for ih, word in enumerate(pred):
+                offset = ih * (height_cell + padding) + centering
+                draw.text((0, offset), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+
+            images = np.concatenate([images, np.array(canvas)], axis=1)
 
             H,W ,C = images.shape
 
@@ -286,81 +323,103 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             draw = ImageDraw.Draw(canvas) 
             padding = 5
             centering = 50
-            words = f'style_img,style_content({style_label}),random_content({content_label})'.split(',')
+            words = f'real,label,lower_label, pred_from_real'.split(',')
             for iw, word in enumerate(words):
                 offset = iw * (width_cell + padding) + centering
                 draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
-            images = np.concatenate([images, np.array(canvas)], axis=0)            
+            images = np.concatenate([images, np.array(canvas)], axis=0)
+
 
             images = Image.fromarray(images)
 
-            images.save(os.path.join(imsave_path,'dataloader_sample', f'{i}.png'))
+
+            images.save(f'./sample/{args.dir_name}/{str(i).zfill(6)}.png') 
             
+
             continue
 
-        style_img = style_img.to(device)
-        style_gray_img = style_gray_img.to(device)
-        content_gray_img = content_gray_img.to(device)
+        # variance analysis
+        if args.return_var:
+            requires_grad(generator, False)
+            requires_grad(discriminator, False)
+            real_img = real_img.to(device)
+            real_img_resize = functional.resize(real_img, (256, 256))
 
+            gray_text_img = gray_text_img.to(device)
 
-        #D train
+            # style encoder 나온 image
+            _, var_encoder = generator(gray_text_img, real_img_resize, return_var=True)
 
-        # style encoder 나온 image
+            # random noise로 만든 image
+            noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+            _, var_random = generator(gray_text_img, noise, random_style=True, return_var=True)
+
+            var_dic['random'].append(var_encoder)
+            var_dic['encoder'].append(var_random)
+
+            continue
+
+        real_img = real_img.to(device)
+        real_img_resize = functional.resize(real_img, (256, 256))
+
+        gray_text_img = gray_text_img.to(device)
+
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
-        fake_img, _ = generator(content_gray_img,functional.resize(style_img, (256, 256)))
+        # style encoder 나온 image
+        fake_img, _ = generator(gray_text_img, real_img_resize)
 
         if args.augment:
-            real_img_aug, _ = augment(style_img, ada_aug_p)
+            real_img_aug, _ = augment(real_img, ada_aug_p)
             fake_img, _ = augment(fake_img, ada_aug_p)
 
         else:
-            real_img_aug = style_img
-
-
-        fake_pred = discriminator(fake_img)
-        real_pred = discriminator(real_img_aug)
-
-        ## adv loss
-        d_adv_loss = d_logistic_loss(real_pred, fake_pred)
-
-        d_adv_loss = args.d_adv_loss_weight * d_adv_loss
-
-        discriminator.zero_grad()
-        d_adv_loss.backward()
-        d_optim.step()
-
-        loss_dict["d_img_guided"] = d_adv_loss.item()
-
-        # random noise로 만든 image
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(content_gray_img, noise, random_style=True)
+            real_img_aug = real_img
 
         fake_pred = discriminator(fake_img)
         real_pred = discriminator(real_img_aug)
         d_loss = d_logistic_loss(real_pred, fake_pred)
 
-        d_loss = args.d_loss_weight * d_loss
+        discriminator.zero_grad()
+        d_loss.backward()
+        d_optim.step()
+
+        # random noise로 만든 image
+        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        fake_img, _ = generator(gray_text_img, noise, random_style=True)
+
+        fake_pred = discriminator(fake_img)
+        real_pred = discriminator(real_img_aug)
+        d_loss = d_logistic_loss(real_pred, fake_pred)
 
         discriminator.zero_grad()
         d_loss.backward()
         d_optim.step()
 
-        loss_dict["d_noise_guided"] = d_loss.item()
+        if args.tensor:
+            writer.add_scalar("Loss/d_loss", d_loss, idx)
 
+        loss_dict["d"] = d_loss
+        loss_dict["real_score"] = real_pred.mean()
+        loss_dict["fake_score"] = fake_pred.mean()
+
+        if args.augment and args.augment_p == 0:
+            ada_aug_p = ada_augment.tune(real_pred)
+            r_t_stat = ada_augment.r_t_stat
 
         d_regularize = i % args.d_reg_every == 0
+
         if d_regularize:
-            style_img.requires_grad = True
+            real_img.requires_grad = True
 
             if args.augment:
-                real_img_aug, _ = augment(style_img, ada_aug_p)
+                real_img_aug, _ = augment(real_img, ada_aug_p)
             else:
-                real_img_aug = style_img
+                real_img_aug = real_img
 
             real_pred = discriminator(real_img_aug)
-            r1_loss = d_r1_loss(real_pred, style_img)
+            r1_loss = d_r1_loss(real_pred, real_img)
 
             discriminator.zero_grad()
             (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
@@ -369,89 +428,93 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         loss_dict["r1"] = r1_loss
 
-
-        #G train
+        # G train
+        # style encoder로 만든 image
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        ## recon_loss
-        recon_style_img, _ = generator(style_gray_img,functional.resize(style_img, (256, 256)))
-        recon_loss = F.mse_loss(recon_style_img, style_img)
+        fake_refguided, _ = generator(gray_text_img, real_img_resize)
+
+        if args.augment:
+            fake_refguided, _ = augment(fake_refguided, ada_aug_p)
+
+        fake_pred = discriminator(fake_refguided)
+        g_loss = g_nonsaturating_loss(fake_pred)
+
+        fake_refguided, _ = generator(gray_text_img, real_img_resize)
+        fake_refguided_gray = functional.rgb_to_grayscale(fake_refguided)
+
+        # OCR 특수문자 인식 X, 대문자 to 소문자, 25개 미만 글자
+        label = [l.lower() for l in label]
+        #label = [l.translate(str.maketrans('', '', string.punctuation)) for l in label]
+        new_label = []
+        for k in label:
+            for j in k:
+                if not j in args.character:
+                    k = k.replace(j,'')
+            if len(k) > 25:
+                k = k[:25]
+            new_label.append(k)
+
+        closs_preds, closs_target, pred = ocr_pred(args, fake_refguided_gray, new_label, predict_text=True)
+        # import pdb;pdb.set_trace()
+
+        # if args.return_ocr_results:
 
 
-        fake_content_img, _ = generator(content_gray_img,functional.resize(style_img, (256, 256)))
-        fake_content_img_gray = functional.rgb_to_grayscale(fake_content_img)
+        #     # width_cell = real_img.shape[3]
+        #     # images = [real_img, gray_text_img, fake_refguided, fake_img_latentguided, t_fake_img_fixedz, t_fake_img_fixedref, t_fake_img_fixedz_g, t_fake_img_fixedref_g]
+        #     # images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
+        #     # images = torch.cat(images, axis=2) * 255
+        #     # images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
+        #     # H, W, C = images.shape
 
-        fake_noise_img, _ = generator(content_gray_img, noise, random_style=True)
+        #     # canvas_height = 30
+        #     # canvas = np.ones((canvas_height, W, C), images.dtype) * 255
+        #     # font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+        #     # canvas = Image.fromarray(canvas)
+        #     # draw = ImageDraw.Draw(canvas)
+        #     # padding = 5
+        #     # centering = 50
+        #     # words = 'real,content,train_refguided,train_latentguided,fixedz_gema,fixedref_gema,fixedz_g,gixedref_g'.split(',')
+        #     # for iw, word in enumerate(words):
+        #     #     offset = iw * (width_cell + padding) + centering
+        #     #     draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+        #     # images = np.concatenate([images, np.array(canvas)], axis=0)
+        #     # images = Image.fromarray(images)
+        #     # images.save(f'./sample/{args.dir_name}/{str(i).zfill(6)}.png') 
 
-        ## ocr_loss of content image
-        if args.use_ocr_loss_c:
-            fake_content_img, _ = generator(content_gray_img,functional.resize(style_img, (256, 256)))
-            fake_content_img_gray = functional.rgb_to_grayscale(fake_content_img)
+        ocr_loss = c_loss(closs_preds, closs_target)
+        ocr_loss.requires_grad=False
 
-            content_label = preprocess_label(args,content_label)
+        # image recon loss(논문)
+        recon_loss = F.mse_loss(fake_refguided, real_img)
 
-            closs_preds, closs_target, pred = ocr_pred(args, fake_content_img_gray, content_label, predict_text = True)
+        # latent recon loss
+        orig_latent = generator(gray_text_img, real_img_resize, latent_recon=True)  # real image 넣어서 style encoder latent
+        latent_recon_img = functional.resize(fake_refguided, (256, 256))
+        fake_latent = generator(gray_text_img, latent_recon_img, latent_recon=True)  # fake image 넣어서 style encoder latent
+        recon_latent = F.mse_loss(orig_latent, fake_latent)
 
-            ocr_loss_content = c_loss(closs_preds, closs_target)
-        else :
-            ocr_loss_content = torch.tensor(0.0, device=device)
-
-        ## ocr_loss of style image
-        if args.use_ocr_loss_s:
-            recon_style_img_gray = functional.rgb_to_grayscale(recon_style_img)
-            
-            style_label = preprocess_label(args,style_label)
-
-            sloss_preds, sloss_target, pred = ocr_pred(args, recon_style_img_gray, style_label, predict_text = True)
-
-            ocr_loss_style = c_loss(sloss_preds, sloss_target)
-        else :
-            ocr_loss_style = torch.tensor(0.0, device=device)
-
-        if args.late_ocr_adaptation_n > i:
-            late_ocr_adaptation_weight = 0.0
-        else:
-            late_ocr_adaptation_weight = 1.0
-
-
-        g_loss = args.recon_factor * recon_loss + late_ocr_adaptation_weight * args.ocr_loss_weight * (ocr_loss_content + ocr_loss_style)
-
-
-        loss_dict["g_recon4"] = recon_loss.item()
-        loss_dict["g_ocr_content5"] = ocr_loss_content.item()
-        loss_dict["g_ocr_style6"] = ocr_loss_style.item()
-        loss_dict["g456"]= g_loss.item()
+        # diversity sensitive loss
+        g_loss = g_loss + args.recon_factor * recon_loss
 
         generator.zero_grad()
         g_loss.backward()
         g_optim.step()
 
-        recon_style_img, _ = generator(style_gray_img,functional.resize(style_img, (256, 256)))
-        recon_loss = F.mse_loss(recon_style_img, style_img)
+        # random noise로 만든 image
+        fake_img_latentguided, _ = generator(gray_text_img, noise, random_style=True)
 
+        fake_pred = discriminator(fake_img_latentguided)
+        g_loss = g_nonsaturating_loss(fake_pred)
 
-        fake_content_img, _ = generator(content_gray_img,functional.resize(style_img, (256, 256)))
-        fake_content_img_gray = functional.rgb_to_grayscale(fake_content_img)
-
-        fake_noise_img, _ = generator(content_gray_img, noise, random_style=True)
-
-        ## adv loss
-        g_adv_loss_recon = g_nonsaturating_loss(discriminator(recon_style_img))
-        g_adv_loss_content = g_nonsaturating_loss(discriminator(fake_content_img))
-        g_adv_loss_noise = g_nonsaturating_loss(discriminator(fake_noise_img))
-
-        g_loss = args.g_adv_weight * (g_adv_loss_recon + g_adv_loss_content + g_adv_loss_noise) / 3
-
-        # import pdb; pdb.set_trace()
         generator.zero_grad()
         g_loss.backward()
         g_optim.step()
 
-        loss_dict["g_adv_recon1"] = g_adv_loss_recon.item()
-        loss_dict["g_adv_content2"] = g_adv_loss_content.item()
-        loss_dict["g_adv_noise3"] = g_adv_loss_noise.item()
-        loss_dict["g123"] = g_loss.item()
+        if args.tensor:
+            writer.add_scalar("Loss/g_loss", g_loss, idx)
 
         loss_dict["path"] = path_loss
         loss_dict["path_length"] = path_lengths.mean()
@@ -459,7 +522,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         g_regularize = i % args.g_reg_every == 0
 
         if g_regularize:
-            fake_img_latentguided, latents = generator(content_gray_img, noise, random_style=True, return_latents=True)
+            fake_img_latentguided, latents = generator(gray_text_img, noise, random_style=True, return_latents=True)
             # fake_img, latents = generator(gray_text_img, real_img_resize, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
@@ -472,47 +535,87 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             if args.path_batch_shrink:
                 weighted_path_loss += 0 * fake_img_latentguided[0, 0, 0, 0]
 
-            weighted_path_loss = args.g_adv_weight * weighted_path_loss
             weighted_path_loss.backward()
             g_optim.step()
 
             mean_path_length_avg = (
                 reduce_sum(mean_path_length).item() / get_world_size()
             )
-        
+
+        loss_dict["recon_image"] = recon_loss
+        loss_dict["recon_latent"] = recon_latent
+        loss_dict["ocr_loss"] = ocr_loss
+        loss_dict["g"] = g_loss
+
         accumulate(g_ema, g_module, accum)
 
         loss_reduced = reduce_loss_dict(loss_dict)
 
+        d_loss_val = loss_reduced["d"].mean().item()
+        g_loss_val = loss_reduced["g"].mean().item()
+        r1_val = loss_reduced["r1"].mean().item()
+        path_loss_val = loss_reduced["path"].mean().item()
+        real_score_val = loss_reduced["real_score"].mean().item()
+        fake_score_val = loss_reduced["fake_score"].mean().item()
+        path_length_val = loss_reduced["path_length"].mean().item()
+
         if get_rank() == 0:
             pbar.set_description((
-                f'g_123: {loss_reduced["g123"]:.4f}; ' #g_adv_recon1: {loss_reduced["g_adv_recon1"]:.4f}; g_adv_content2: {loss_reduced["g_adv_content2"]:.4f}; g_adv_noise3: {loss_reduced["g_adv_noise3"]:.4f}; '
-                f'g_456: {loss_reduced["g456"]:.4f}; '# g_recon4: {loss_reduced["g_recon4"]:.4f}; g_ocr_content5: {loss_reduced["g_ocr_content5"]:.4f}; g_ocr_style6: {loss_reduced["g_ocr_style6"]:.4f}; '
-                f'd_total: {loss_reduced["d_noise_guided"]+ loss_reduced["d_img_guided"]}'#, d_noise_guided: {loss_reduced["d_noise_guided"]:.4f}; d_img_guided: {loss_reduced["d_img_guided"]:.4f}; '
-                #f'r1: {loss_reduced["r1"]:.4f}; path: {loss_reduced["path"]:.4f}; path_length: {loss_reduced["path_length"]:.4f}; mean_path_length: {mean_path_length_avg:.4f}; '
-
+                    f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
+                    f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
+                    f"augment: {ada_aug_p:.4f}"
             ))
 
             if wandb and args.wandb:
                 wandb.log(
                     {
-                        "g_123": loss_reduced["g123"],
-                        "g_adv_recon1": loss_reduced["g_adv_recon1"],
-                        "g_adv_content2": loss_reduced["g_adv_content2"],
-                        "g_adv_noise3": loss_reduced["g_adv_noise3"],
-                        "g_456": loss_reduced["g456"],
-                        "g_recon4": loss_reduced["g_recon4"],
-                        "g_ocr_content5": loss_reduced["g_ocr_content5"],
-                        "g_ocr_style6": loss_reduced["g_ocr_style6"],
-                        "d_total": loss_reduced["d_noise_guided"]+ loss_reduced["d_img_guided"],
-                        "d_noise_guided": loss_reduced["d_noise_guided"],
-                        "d_img_guided": loss_reduced["d_img_guided"],
-                        "r1": loss_reduced["r1"],
-                        "path": loss_reduced["path"],
-                        "path_length": loss_reduced["path_length"],
-                        "mean_path_length": mean_path_length_avg,
+                        "Generator": g_loss_val,
+                        "Discriminator": d_loss_val,
+                        "Augment": ada_aug_p,
+                        "Rt": r_t_stat,
+                        "R1": r1_val,
+                        "Path Length Regularization": path_loss_val,
+                        "Mean Path Length": mean_path_length,
+                        "Real Score": real_score_val,
+                        "Fake Score": fake_score_val,
+                        "Path Length": path_length_val,
                     }
                 )
+
+            if i % args.image_every == 0:
+                with torch.no_grad():
+                    g_ema.eval()
+
+                    t_fake_img_fixedz, _ = g_ema(c_demo_image_gray, [fixed_z], random_style=True)
+                    t_fake_img_fixedref, _ = g_ema(c_demo_image_gray, ex_img_resize)
+
+                    generator.eval()
+
+                    t_fake_img_fixedz_g, _ = generator(c_demo_image_gray, [fixed_z], random_style=True)
+                    t_fake_img_fixedref_g, _ = generator(c_demo_image_gray, ex_img_resize)
+
+
+                    width_cell = real_img.shape[3]
+                    images = [real_img, gray_text_img, fake_refguided, fake_img_latentguided, t_fake_img_fixedz, t_fake_img_fixedref, t_fake_img_fixedz_g, t_fake_img_fixedref_g]
+                    images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
+                    images = torch.cat(images, axis=2) * 255
+                    images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
+                    H, W, C = images.shape
+
+                    canvas_height = 30
+                    canvas = np.ones((canvas_height, W, C), images.dtype) * 255
+                    font = ImageFont.truetype('NanumGothicBold.ttf', 20)
+                    canvas = Image.fromarray(canvas)
+                    draw = ImageDraw.Draw(canvas)
+                    padding = 5
+                    centering = 50
+                    words = 'real,content,train_refguided,train_latentguided,fixedz_gema,fixedref_gema,fixedz_g,gixedref_g'.split(',')
+                    for iw, word in enumerate(words):
+                        offset = iw * (width_cell + padding) + centering
+                        draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
+                    images = np.concatenate([images, np.array(canvas)], axis=0)
+                    images = Image.fromarray(images)
+                    images.save(f'./sample/{args.dir_name}/{str(i).zfill(6)}.png')
 
             if i % args.ckpt_every == 0:
                 torch.save({"g": g_module.state_dict(),
@@ -527,79 +630,11 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                            )
 
 
-            if i % args.image_every == 0:
-                with torch.no_grad():
-                    # g_ema.eval()
-
-                    generator.eval()
-
-                    # t_fake_img_fixedz, _ = g_ema(c_demo_image_gray, [fixed_z], random_style=True)
-                    # t_fake_img_fixedref, _ = g_ema(c_demo_image_gray, ex_style_resize)
-
-                    generator.eval()
-
-                    t_fake_img_fixedz_g, _ = generator(c_demo_image_gray, [fixed_z], random_style=True)
-                    t_fake_img_fixedref_g, _ = generator(c_demo_image_gray, ex_style_resize)
-
-                    # training
-                    width_cell = style_img.shape[3]
-                    images = [style_img, style_gray_img,recon_style_img,content_gray_img,fake_content_img,fake_noise_img]
-                    images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
-                    images = torch.cat(images, axis=2) * 255
-                    images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
-                    H, W, C = images.shape
-
-                    canvas_height = 30
-                    canvas = np.ones((canvas_height, W, C), images.dtype) * 255
-                    font = ImageFont.truetype('NanumGothicBold.ttf', 20)
-                    canvas = Image.fromarray(canvas)
-                    draw = ImageDraw.Draw(canvas)
-                    padding = 5
-                    centering = 50
-                    words = 'style,style_gray,recon_style,content_gray,pred_content,noise_guided'.split(',')
-                    for iw, word in enumerate(words):
-                        offset = iw * (width_cell + padding) + centering
-                        draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
-                    images = np.concatenate([images, np.array(canvas)], axis=0)
-                    images = Image.fromarray(images)
-                    tmp_dir = f'./sample/{args.dir_name}/train/'
-                    if not os.path.exists(tmp_dir):
-                        os.makedirs(tmp_dir)
-                    images.save(tmp_dir + f'{str(i).zfill(6)}.png')    
-
-                    #fixed
-                    images = [ex_style, c_demo_image_gray, t_fake_img_fixedref_g, t_fake_img_fixedz_g]
-                    images = [tvutils.make_grid(image, nrow=1, normalize=True, range=(-1, 1)) for image in images]
-                    images = torch.cat(images, axis=2) * 255
-                    images = images.cpu().numpy().astype('uint8').transpose(1, 2, 0)  # H W C
-                    H, W, C = images.shape
-
-                    canvas_height = 30
-                    canvas = np.ones((canvas_height, W, C), images.dtype) * 255
-                    font = ImageFont.truetype('NanumGothicBold.ttf', 20)
-                    canvas = Image.fromarray(canvas)
-                    draw = ImageDraw.Draw(canvas)
-                    padding = 5
-                    centering = 50
-                    words = 'style,content_gray,pred_content,noise_guided'.split(',')
-                    for iw, word in enumerate(words):
-                        offset = iw * (width_cell + padding) + centering
-                        draw.text((offset, 0), word, fill='black', font=font, stroke_width=3, stroke_fill='white')
-                    images = np.concatenate([images, np.array(canvas)], axis=0)
-                    images = Image.fromarray(images)
-                    tmp_dir = f'./sample/{args.dir_name}/fixed/'
-                    if not os.path.exists(tmp_dir):
-                        os.makedirs(tmp_dir)
-                    images.save(tmp_dir + f'{str(i).zfill(6)}.png')   
-
-
-
 if __name__ == "__main__":
     device = "cuda"
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument('--late_ocr_adaptation_n', type=int, default=0)
     parser.add_argument('--dataset', type=str, default=None, help='tet_gen or image_gru5k')
     parser.add_argument("--dataset_dir", type=str, default='/mnt/f06b55a9-977c-474a-bed0-263449158d6a/text_dataset/datasets/IMGUR5K-Handwriting-Dataset', help='datset directory')
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
@@ -626,12 +661,6 @@ if __name__ == "__main__":
     parser.add_argument("--augment_p", type=float, default=0, help="probability of applying augmentation. 0 = use adaptive augmentation",)
     parser.add_argument("--ada_target", type=float, default=0.6, help="target augmentation probability for adaptive augmentation",)
     parser.add_argument("--recon_factor", type=float, default=10.0, help="reconstruction loss facator",)
-    parser.add_argument("--d_adv_loss_weight", type=float, default=1.0, help="discriminator adv loss weight",)
-    parser.add_argument("--d_loss_weight", type=float, default=1.0, help="discriminator loss weight",)
-    parser.add_argument("--g_adv_weight", type=float, default=1.0, help="generator adv loss weight",)
-    parser.add_argument("--ocr_loss_weight", type=float, default=1.0, help="ocr loss weight",)
-    parser.add_argument("--use_ocr_loss_c", action="store_true", help="use ocr loss for content",)
-    parser.add_argument("--use_ocr_loss_s", action="store_true", help="use ocr loss for style",)
     parser.add_argument("--ada_length", type=int, default=500 * 1000,
                         help="target duraing to reach augmentation probability for adaptive augmentation",)
     parser.add_argument("--ada_every", type=int, default=256, help="probability update interval of the adaptive augmentation",)
@@ -648,6 +677,7 @@ if __name__ == "__main__":
 
     """ Analysis """
     parser.add_argument('--return_var', action='store_true', help='return_var')
+    parser.add_argument('--tensor', action='store_true', help='tensorboard')
 
     """OCR"""
     parser.add_argument('--saved_model', required=True, help="path to saved_model to evaluation")
@@ -743,7 +773,7 @@ if __name__ == "__main__":
             output_device=args.local_rank,
             broadcast_buffers=False,
         )
-
+        
     if args.dataset == "tet_gen":
         img_folder = args.dataset_dir + "/imagesA"
         test_label_path = args.dataset_dir + "/gt.txt"
@@ -753,11 +783,9 @@ if __name__ == "__main__":
         label_path = args.dataset_dir+'/label_dic.json'
         gray_text_folder = args.dataset_dir+'/gray_text'
 
-
     # dataset = IMGUR5K_Handwriting(args.img_folder, args.test_label_path, args.gray_text_folder, train=True)
     if args.dataset == "tet_gen":
-        dataset = tet_ganA(img_folder, test_label_path, gray_text_folder, train=True,content_resnet=True)    
-        dataset_extra = tet_ganB(img_folder, test_label_path, gray_text_folder, train=True,content_resnet=True)
+        dataset = tet_ganA(img_folder, test_label_path, gray_text_folder, train=True)
     elif args.content_resnet:
         dataset = IMGUR5K_Handwriting(img_folder, label_path, gray_text_folder, train=True, content_resnet=True)
     else:
@@ -768,13 +796,7 @@ if __name__ == "__main__":
         sampler=data_sampler(dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
     )
-    loader_extra = data.DataLoader(
-        dataset_extra,
-        batch_size=args.batch,
-        sampler=data_sampler(dataset_extra, shuffle=True, distributed=args.distributed),
-        drop_last=True,
-    )
 
     if get_rank() == 0 and wandb is not None and args.wandb:
-        wandb.init(project=args.dir_name)
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, loader_extra = loader_extra)
+        wandb.init(project="stylegan 2")
+    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)

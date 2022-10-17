@@ -1,0 +1,65 @@
+--------------------------------------------------------------------------------
+image_path               	predicted_labels         	confidence score
+--------------------------------------------------------------------------------
+demo_image/demo_1.png    	available                	0.9999
+demo_image/demo_2.jpg    	shakeshack               	0.9419
+demo_image/demo_3.png    	london                   	0.8703
+demo_image/demo_4.png    	greenstead               	0.9990
+demo_image/demo_5.png    	toast                    	0.9971
+demo_image/demo_6.png    	merry                    	0.9987
+demo_image/demo_7.png    	underground              	1.0000
+demo_image/demo_8.jpg    	ronaldo                  	0.8983
+demo_image/demo_9.jpg    	bally                    	0.8473
+demo_image/demo_10.jpg   	university               	0.9999
+--------------------------------------------------------------------------------
+image_path               	predicted_labels         	confidence score
+--------------------------------------------------------------------------------
+demo_image/demo_1.png    	available                	0.9999
+demo_image/demo_2.jpg    	shakeshack               	0.9425
+demo_image/demo_3.png    	london                   	0.8691
+demo_image/demo_4.png    	greenstead               	0.9990
+demo_image/demo_5.png    	toast                    	0.9971
+demo_image/demo_6.png    	merry                    	0.9987
+demo_image/demo_7.png    	underground              	1.0000
+demo_image/demo_8.jpg    	ronaldo                  	0.8982
+demo_image/demo_9.jpg    	bally                    	0.8432
+demo_image/demo_10.jpg   	university               	0.9999
+--------------------------------------------------------------------------------
+image_path               	predicted_labels         	confidence score
+--------------------------------------------------------------------------------
+demo_image/demo_1.png    	available                	0.9999
+demo_image/demo_2.jpg    	shakeshack               	0.9421
+demo_image/demo_3.png    	london                   	0.8690
+demo_image/demo_4.png    	greenstead               	0.9990
+demo_image/demo_5.png    	toast                    	0.9971
+demo_image/demo_6.png    	merry                    	0.9987
+demo_image/demo_7.png    	underground              	1.0000
+demo_image/demo_8.jpg    	ronaldo                  	0.8982
+demo_image/demo_9.jpg    	bally                    	0.8474
+demo_image/demo_10.jpg   	university               	0.9999
+--------------------------------------------------------------------------------
+image_path               	predicted_labels         	confidence score
+--------------------------------------------------------------------------------
+demo_image/demo_1.png    	available                	0.9999
+demo_image/demo_2.jpg    	shakeshack               	0.9422
+demo_image/demo_3.png    	london                   	0.8690
+demo_image/demo_4.png    	greenstead               	0.9990
+demo_image/demo_5.png    	toast                    	0.9971
+demo_image/demo_6.png    	merry                    	0.9987
+demo_image/demo_7.png    	underground              	1.0000
+demo_image/demo_8.jpg    	ronaldo                  	0.8981
+demo_image/demo_9.jpg    	bally                    	0.8473
+demo_image/demo_10.jpg   	university               	0.9999
+--------------------------------------------------------------------------------
+image_path               	predicted_labels         	confidence score
+--------------------------------------------------------------------------------
+demo_image/demo_1.png    	available                	0.9999
+demo_image/demo_2.jpg    	shakeshack               	0.9418
+demo_image/demo_3.png    	london                   	0.8701
+demo_image/demo_4.png    	greenstead               	0.9990
+demo_image/demo_5.png    	toast                    	0.9971
+demo_image/demo_6.png    	merry                    	0.9987
+demo_image/demo_7.png    	underground              	1.0000
+demo_image/demo_8.jpg    	ronaldo                  	0.8983
+demo_image/demo_9.jpg    	bally                    	0.8473
+demo_image/demo_10.jpg   	university               	0.9999
